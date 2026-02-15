@@ -1,0 +1,27 @@
+[package]
+name = "recorder-for-jetkvm"
+version = "0.1.0"
+edition = "2024"
+authors = ["Ivan Bodrov <ibodrov@gmail.com>"]
+description = "JetKVM recorder and screenshot utility"
+documentation = "https://docs.rs/recorder-for-jetkvm"
+homepage = "https://github.com/ibodrov/recorder-for-jetkvm"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ibodrov/recorder-for-jetkvm"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+webrtc = "0.17"
+reqwest = { version = "0.12", features = ["cookies", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ffmpeg-the-third = "4"
+chrono = "0.4"
+anyhow = "1"
+bytes = "1"
+directories = "6"
