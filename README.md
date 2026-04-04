@@ -8,7 +8,17 @@ By default:
 - recordings are saved in your operating system's video folder
 - screenshots are saved in your operating system's pictures folder
 
-## Build
+## Install
+
+Install from crates.io:
+
+```bash
+cargo install recorder-for-jetkvm
+```
+
+After that, the `recorder-for-jetkvm` binary should be available in your Cargo bin directory.
+
+## Build From Source
 
 ```bash
 cargo build --release
@@ -22,20 +32,20 @@ Record screen changes to MP4 files:
 
 ```bash
 export JETKVM_PASSWORD='your-password'
-./target/release/recorder-for-jetkvm --host 192.168.1.130
+recorder-for-jetkvm --host 192.168.1.130
 ```
 
 Capture a single screenshot:
 
 ```bash
 export JETKVM_PASSWORD='your-password'
-./target/release/recorder-for-jetkvm --host 192.168.1.130 --screenshot
+recorder-for-jetkvm --host 192.168.1.130 --screenshot
 ```
 
 Override the default output locations:
 
 ```bash
-./target/release/recorder-for-jetkvm \
+recorder-for-jetkvm \
   --host 192.168.1.130 \
   --output-dir /path/to/recordings \
   --screenshot-output /path/to/capture.png
@@ -44,7 +54,7 @@ Override the default output locations:
 Use a password file instead of an environment variable:
 
 ```bash
-./target/release/recorder-for-jetkvm \
+recorder-for-jetkvm \
   --host 192.168.1.130 \
   --password-file ~/.config/jetkvm-password
 ```
