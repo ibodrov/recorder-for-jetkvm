@@ -22,7 +22,7 @@ use crate::rpc::{
 };
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
-const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
+const UPLOAD_CHUNK_SIZE: usize = 16 * 1024;
 const DATA_CHANNEL_BUFFER_LOW: usize = 512 * 1024;
 const DATA_CHANNEL_BUFFER_HIGH: usize = 2 * 1024 * 1024;
 
@@ -706,6 +706,11 @@ fn redact_state(mut state: VirtualMediaState) -> VirtualMediaState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use webrtc::api::APIBuilder;
+    use webrtc::api::media_engine::MediaEngine;
+    use webrtc::peer_connection::configuration::RTCConfiguration;
 
     #[test]
     fn approval_is_required_for_mutation() {
@@ -774,5 +779,133 @@ mod tests {
         let total = 10_000_u64;
         assert_eq!(total - offset, 5904);
         assert!(offset <= total);
+    }
+
+    #[tokio::test]
+    async fn webrtc_upload_channel_resumes_and_streams_exact_remaining_bytes() {
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_default_codecs()
+            .expect("default codecs");
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let offer_peer = api
+            .new_peer_connection(RTCConfiguration::default())
+            .await
+            .expect("offer peer");
+        let answer_peer = api
+            .new_peer_connection(RTCConfiguration::default())
+            .await
+            .expect("answer peer");
+        offer_peer
+            .create_data_channel("rpc", None)
+            .await
+            .expect("initial data channel");
+
+        let expected = Arc::new((37_u8..=255).cycle().take(96 * 1024).collect::<Vec<_>>());
+        let resume_offset = 4096_u64;
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let received_done = Arc::new(Notify::new());
+        let channel_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let channel_seen_for_callback = Arc::clone(&channel_seen);
+        let received_done_for_channel = Arc::clone(&received_done);
+        let received_for_channel = Arc::clone(&received);
+        let expected_remaining = expected.len() - resume_offset as usize;
+        answer_peer.on_data_channel(Box::new(move |channel| {
+            let received = Arc::clone(&received_for_channel);
+            let received_done = Arc::clone(&received_done_for_channel);
+            let channel_seen = Arc::clone(&channel_seen_for_callback);
+            Box::pin(async move {
+                if channel.label() != "upload-test" {
+                    return;
+                }
+                channel_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                let channel_for_message = Arc::clone(&channel);
+                channel.on_message(Box::new(move |message| {
+                    let received = Arc::clone(&received);
+                    let channel = Arc::clone(&channel_for_message);
+                    let received_done = Arc::clone(&received_done);
+                    Box::pin(async move {
+                        let mut received = received.lock().await;
+                        received.extend_from_slice(&message.data);
+                        if received.len() == expected_remaining {
+                            drop(received);
+                            channel.close().await.expect("close upload channel");
+                            received_done.notify_one();
+                        }
+                    })
+                }));
+            })
+        }));
+
+        let offer = offer_peer.create_offer(None).await.expect("offer");
+        let mut offer_gathering = offer_peer.gathering_complete_promise().await;
+        offer_peer
+            .set_local_description(offer)
+            .await
+            .expect("set offer");
+        offer_gathering.recv().await;
+        answer_peer
+            .set_remote_description(
+                offer_peer
+                    .local_description()
+                    .await
+                    .expect("gathered offer"),
+            )
+            .await
+            .expect("apply offer");
+        let answer = answer_peer.create_answer(None).await.expect("answer");
+        let mut answer_gathering = answer_peer.gathering_complete_promise().await;
+        answer_peer
+            .set_local_description(answer)
+            .await
+            .expect("set answer");
+        answer_gathering.recv().await;
+        offer_peer
+            .set_remote_description(
+                answer_peer
+                    .local_description()
+                    .await
+                    .expect("gathered answer"),
+            )
+            .await
+            .expect("apply answer");
+
+        let file = tempfile::NamedTempFile::new().expect("temporary upload file");
+        std::fs::write(file.path(), expected.as_slice()).expect("write upload fixture");
+        let (events, _) = broadcast::channel(4);
+        let cancellation = CancellationToken::new();
+        upload_over_data_channel(
+            &Arc::new(offer_peer),
+            "upload-test",
+            UploadTransfer {
+                path: file.path(),
+                filename: "fixture.iso",
+                total: expected.len() as u64,
+                uploaded: resume_offset,
+                events: &events,
+                cancellation: &cancellation,
+            },
+        )
+        .await
+        .expect("WebRTC upload");
+        assert!(
+            channel_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "remote peer did not receive dynamic upload channel"
+        );
+        if tokio::time::timeout(Duration::from_secs(5), received_done.notified())
+            .await
+            .is_err()
+        {
+            panic!(
+                "remote peer received {} of {expected_remaining} upload bytes",
+                received.lock().await.len()
+            );
+        }
+
+        assert_eq!(
+            received.lock().await.as_slice(),
+            &expected[resume_offset as usize..]
+        );
+        answer_peer.close().await.expect("close answer peer");
     }
 }
