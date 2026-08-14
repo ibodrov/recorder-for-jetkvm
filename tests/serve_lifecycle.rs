@@ -4,16 +4,49 @@
 //! shutdown must not depend on connectivity.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_recorder-for-jetkvm");
 const DEADLINE: Duration = Duration::from_secs(30);
 
 struct Server {
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    stdin: Option<ChildStdin>,
+    stdout: Receiver<std::io::Result<String>>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn read_output(stdout: ChildStdout) -> Receiver<std::io::Result<String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) => {
+                    if tx.send(Ok(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                    return;
+                }
+            }
+        }
+    });
+    rx
 }
 
 fn spawn_server() -> Server {
@@ -26,10 +59,10 @@ fn spawn_server() -> Server {
         .spawn()
         .expect("failed to spawn recorder-for-jetkvm");
     let stdin = child.stdin.take().expect("stdin pipe");
-    let stdout = BufReader::new(child.stdout.take().expect("stdout pipe"));
+    let stdout = read_output(child.stdout.take().expect("stdout pipe"));
     let mut server = Server {
         child,
-        stdin,
+        stdin: Some(stdin),
         stdout,
     };
     request(
@@ -53,19 +86,24 @@ fn spawn_server() -> Server {
 
 fn request(server: &mut Server, id: u64, method: &str, params: serde_json::Value) {
     let line = serde_json::json!({ "id": id, "method": method, "params": params });
-    writeln!(server.stdin, "{line}").expect("write request");
-    server.stdin.flush().expect("flush request");
+    let stdin = server.stdin.as_mut().expect("stdin remains open");
+    writeln!(stdin, "{line}").expect("write request");
+    stdin.flush().expect("flush request");
 }
 
 /// Reads until the response for `id` arrives; asserts every stdout line is
 /// valid NDJSON (events are skipped).
 fn response(server: &mut Server, id: u64) -> serde_json::Value {
-    let started = Instant::now();
+    let started = std::time::Instant::now();
     loop {
-        assert!(started.elapsed() < DEADLINE, "response {id} timed out");
-        let mut line = String::new();
-        let read = server.stdout.read_line(&mut line).expect("read stdout");
-        assert!(read > 0, "stdout closed before response {id}");
+        let remaining = DEADLINE
+            .checked_sub(started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let line = server
+            .stdout
+            .recv_timeout(remaining)
+            .unwrap_or_else(|error| panic!("response {id} timed out or stdout closed: {error}"))
+            .expect("read stdout");
         let value: serde_json::Value =
             serde_json::from_str(line.trim()).expect("stdout line is not valid NDJSON");
         if value.get("event").is_some() {
@@ -78,8 +116,8 @@ fn response(server: &mut Server, id: u64) -> serde_json::Value {
 }
 
 fn expect_clean_exit(mut server: Server, context: &str) {
-    drop(server.stdin);
-    let started = Instant::now();
+    drop(server.stdin.take());
+    let started = std::time::Instant::now();
     loop {
         match server.child.try_wait().expect("wait on child") {
             Some(status) => {
@@ -98,6 +136,36 @@ fn expect_clean_exit(mut server: Server, context: &str) {
 }
 
 #[test]
+fn recorder_worker_failure_exits_nonzero_promptly() {
+    let mut child = Command::new(BIN)
+        .args([
+            "--host",
+            "http://127.0.0.1:1",
+            "--output-dir",
+            "/proc/recorder-for-jetkvm-test",
+        ])
+        .env("JETKVM_PASSWORD", "test-password")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn recorder");
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("wait on recorder") {
+            assert!(!status.success(), "worker failure must exit nonzero");
+            break;
+        }
+        if started.elapsed() >= DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("recorder did not exit after its worker failed");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn unsupported_protocol_version_is_rejected_cleanly() {
     let mut child = Command::new(BIN)
         .args(["serve", "--stdio", "--host", "http://127.0.0.1:1"])
@@ -107,9 +175,11 @@ fn unsupported_protocol_version_is_rejected_cleanly() {
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn recorder-for-jetkvm");
+    let stdin = child.stdin.take().expect("stdin pipe");
+    let stdout = read_output(child.stdout.take().expect("stdout pipe"));
     let mut server = Server {
-        stdin: child.stdin.take().expect("stdin pipe"),
-        stdout: BufReader::new(child.stdout.take().expect("stdout pipe")),
+        stdin: Some(stdin),
+        stdout,
         child,
     };
     request(
@@ -148,6 +218,18 @@ fn protocol_shutdown_exits_cleanly_while_offline() {
         "shutdown failed: {shutdown}"
     );
     expect_clean_exit(server, "protocol shutdown");
+}
+#[test]
+fn protocol_shutdown_preempts_a_pending_connect() {
+    let mut server = spawn_server();
+    request(&mut server, 2, "connect", serde_json::json!({}));
+    request(&mut server, 3, "shutdown", serde_json::json!({}));
+    let shutdown = response(&mut server, 3);
+    assert!(
+        shutdown.get("result").is_some(),
+        "shutdown failed behind a pending connect: {shutdown}"
+    );
+    expect_clean_exit(server, "preemptive protocol shutdown");
 }
 
 #[test]

@@ -136,6 +136,27 @@ enum ActiveKind {
 }
 
 type ActiveMap = Arc<Mutex<HashMap<String, ActiveKind>>>;
+async fn admit_request(
+    active: &ActiveMap,
+    key: String,
+    kind: ActiveKind,
+) -> Option<(&'static str, String)> {
+    let mut active = active.lock().await;
+    if active.contains_key(&key) {
+        Some((
+            "duplicate_request_id",
+            "request id is already active".to_owned(),
+        ))
+    } else if active.len() >= MAX_ACTIVE_REQUESTS {
+        Some((
+            codes::SERVER_BUSY,
+            format!("at most {MAX_ACTIVE_REQUESTS} requests may be active"),
+        ))
+    } else {
+        active.insert(key, kind);
+        None
+    }
+}
 
 /// A state-changing request queued for the ordered dispatcher.
 struct QueuedRequest {
@@ -216,13 +237,11 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
         let dispatch_controller = controller.clone();
         let dispatch_output = output_tx.clone();
         let dispatch_active = Arc::clone(&active);
-        let dispatch_shutdown = server_shutdown.clone();
         tokio::spawn(async move {
             run_dispatcher(
                 dispatch_rx,
                 dispatch_output,
                 dispatch_active,
-                dispatch_shutdown,
                 move |method, params, upload_cancellation| {
                     let controller = dispatch_controller.clone();
                     async move { dispatch(&controller, &method, params, upload_cancellation).await }
@@ -233,6 +252,7 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
     };
 
     let mut handshake_complete = false;
+    let mut shutdown_response: Option<(Value, String)> = None;
 
     loop {
         tokio::select! {
@@ -307,24 +327,19 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                             }
                             handshake_complete = true;
                             let status = controller.status().await?;
-                            let supports_check_mount_url =
-                                crate::controller::supports_check_mount_url(
-                                    status.device_version.as_deref(),
-                                );
-                            let warnings = if supports_check_mount_url {
-                                Vec::new()
-                            } else {
-                                vec![
+                            let warnings = match status.device_capabilities.check_mount_url {
+                                Some(false) => vec![
                                     "JetKVM firmware does not support checkMountUrl; \
                                      preflight URL checks are disabled",
-                                ]
+                                ],
+                                Some(true) | None => Vec::new(),
                             };
                             send_success(
                                 &output_tx,
                                 request.id,
                                 serde_json::json!({
                                     "protocol_version": PROTOCOL_VERSION,
-                                    "capabilities": capability_names(supports_check_mount_url),
+                                    "capabilities": capability_names(),
                                     "warnings": warnings,
                                     "status": status,
                                 }),
@@ -343,14 +358,41 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                             continue;
                         }
 
+                        let key = request_key(&request.id);
+                        let upload_cancellation =
+                            (request.method == "upload").then(CancellationToken::new);
+                        let admission_error = admit_request(
+                            &active,
+                            key.clone(),
+                            upload_cancellation
+                                .clone()
+                                .map_or(ActiveKind::Other, ActiveKind::Upload),
+                        )
+                        .await;
+                        if let Some((code, message)) = admission_error {
+                            let response_id = if code == "duplicate_request_id" {
+                                Value::Null
+                            } else {
+                                request.id
+                            };
+                            send_error(&output_tx, response_id, code, message).await?;
+                            continue;
+                        }
+
+                        if request.method == "shutdown" {
+                            shutdown_response = Some((request.id, key));
+                            server_shutdown.cancel();
+                            break;
+                        }
+
                         // Cancellation is truthful: uploads only, routed
                         // inline so it stays responsive while the ordered
                         // worker is busy.
                         if request.method == "cancel" {
                             match serde_json::from_value::<CancelParams>(request.params) {
                                 Ok(params) => {
-                                    let key = request_key(&params.id);
-                                    match cancel_active(&active, &key).await {
+                                    let target_key = request_key(&params.id);
+                                    match cancel_active(&active, &target_key).await {
                                         CancelOutcome::Cancelled => {
                                             send_success(
                                                 &output_tx,
@@ -385,6 +427,7 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                                     ).await?;
                                 }
                             }
+                            active.lock().await.remove(&key);
                             continue;
                         }
 
@@ -402,40 +445,10 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                                         .await?;
                                 }
                             }
+                            active.lock().await.remove(&key);
                             continue;
                         }
 
-                        // Everything else is state-changing and must execute
-                        // in NDJSON input order on the ordered dispatcher.
-                        let key = request_key(&request.id);
-                        let upload_cancellation =
-                            (request.method == "upload").then(CancellationToken::new);
-                        let admission_error = {
-                            let mut active = active.lock().await;
-                            if active.contains_key(&key) {
-                                Some((
-                                    "duplicate_request_id",
-                                    "request id is already active".to_owned(),
-                                ))
-                            } else if active.len() >= MAX_ACTIVE_REQUESTS {
-                                Some((
-                                    codes::SERVER_BUSY,
-                                    format!("at most {MAX_ACTIVE_REQUESTS} requests may be active"),
-                                ))
-                            } else {
-                                active.insert(
-                                    key.clone(),
-                                    upload_cancellation
-                                        .clone()
-                                        .map_or(ActiveKind::Other, ActiveKind::Upload),
-                                );
-                                None
-                            }
-                        };
-                        if let Some((code, message)) = admission_error {
-                            send_error(&output_tx, request.id, code, message).await?;
-                            continue;
-                        }
                         dispatch_tx
                             .send(QueuedRequest {
                                 id: request.id,
@@ -451,8 +464,9 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
         }
     }
 
-    // Shutdown orchestration: stop admitting work, cancel active uploads
-    // before draining, then let the ordered worker finish.
+    // Stop admission, cancel uploads, and trigger lifecycle cleanup before
+    // draining ordered work. Controller shutdown interrupts a blocked device
+    // operation, allowing the dispatcher to complete promptly.
     {
         let active = active.lock().await;
         for kind in active.values() {
@@ -462,20 +476,34 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
         }
     }
     drop(dispatch_tx);
+    let controller_result = controller.shutdown().await;
     let mut dispatcher = dispatcher;
-    if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, &mut dispatcher)
-        .await
-        .is_err()
-    {
-        dispatcher.abort();
+    let drain_result = match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, &mut dispatcher).await {
+        Ok(result) => result.context("ordered dispatcher task failed"),
+        Err(_) => {
+            dispatcher.abort();
+            Err(anyhow::anyhow!(
+                "ordered dispatcher did not stop within the shutdown deadline"
+            ))
+        }
+    };
+    let cleanup_result = controller_result.and(drain_result);
+
+    if let Some((id, key)) = shutdown_response {
+        active.lock().await.remove(&key);
+        match &cleanup_result {
+            Ok(()) => send_success(&output_tx, id, Value::Null).await?,
+            Err(error) => {
+                let error = public_error(error);
+                send_error(&output_tx, id, error.code, error.message).await?;
+            }
+        }
     }
-    // Every exit path (protocol shutdown, EOF, SIGINT/SIGTERM) converges on
-    // the controller's idempotent shutdown; a cleanup failure exits nonzero.
-    controller.shutdown().await?;
+
     event_task.abort();
     drop(output_tx);
     writer.await.context("protocol writer task failed")??;
-    Ok(())
+    cleanup_result
 }
 
 /// Waits for Ctrl+C on every platform and SIGTERM on Unix.
@@ -507,22 +535,17 @@ async fn run_dispatcher<H, F>(
     mut rx: mpsc::Receiver<QueuedRequest>,
     output: mpsc::Sender<Value>,
     active: ActiveMap,
-    server_shutdown: CancellationToken,
     handler: H,
 ) where
     H: Fn(String, Value, Option<CancellationToken>) -> F,
-    F: std::future::Future<Output = Result<Value>>,
+    F: Future<Output = Result<Value>>,
 {
     while let Some(queued) = rx.recv().await {
         let key = request_key(&queued.id);
-        let method = queued.method.clone();
         let result = handler(queued.method, queued.params, queued.upload_cancellation).await;
         match result {
             Ok(value) => {
                 let _ = send_success(&output, queued.id, value).await;
-                if method == "shutdown" {
-                    server_shutdown.cancel();
-                }
             }
             Err(error) => {
                 let error = public_error(&error);
@@ -698,18 +721,15 @@ async fn dispatch(
                 .await?;
             Ok(Value::Null)
         }
-        "shutdown" => {
-            controller.shutdown().await?;
-            Ok(Value::Null)
-        }
+        "shutdown" => unreachable!("shutdown is handled by the protocol control plane"),
         other => {
             Err(CodedError::new(codes::UNSUPPORTED, format!("unknown method: {other}")).into())
         }
     }
 }
 
-fn capability_names(supports_check_mount_url: bool) -> Vec<&'static str> {
-    let mut capabilities = vec![
+fn capability_names() -> Vec<&'static str> {
+    vec![
         "connect",
         "disconnect",
         "status",
@@ -720,6 +740,7 @@ fn capability_names(supports_check_mount_url: bool) -> Vec<&'static str> {
         "mouse_button",
         "mouse_scroll",
         "media_state",
+        "check_mount_url",
         "mount_url",
         "mount_local",
         "unmount",
@@ -730,11 +751,7 @@ fn capability_names(supports_check_mount_url: bool) -> Vec<&'static str> {
         "delete_storage",
         "cancel",
         "shutdown",
-    ];
-    if supports_check_mount_url {
-        capabilities.push("check_mount_url");
-    }
-    capabilities
+    ]
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Value) -> Result<T> {
@@ -934,9 +951,9 @@ mod tests {
     }
 
     #[test]
-    fn firmware_capabilities_omit_unsupported_url_check() {
-        assert!(!capability_names(false).contains(&"check_mount_url"));
-        assert!(capability_names(true).contains(&"check_mount_url"));
+    fn capabilities_always_report_sidecar_methods() {
+        assert!(capability_names().contains(&"check_mount_url"));
+        assert!(capability_names().contains(&"shutdown"));
     }
 
     #[test]
@@ -993,13 +1010,46 @@ mod tests {
             CancelOutcome::Cancelled
         ));
         assert!(token.is_cancelled());
+        assert!(
+            active.lock().await.contains_key("\"up\""),
+            "cancellation must retain the upload ID until its terminal response"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_admission_preserves_the_original_active_request() {
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let key = request_key(&serde_json::json!("shared"));
+        let upload = CancellationToken::new();
+        assert!(
+            admit_request(&active, key.clone(), ActiveKind::Upload(upload.clone()),)
+                .await
+                .is_none()
+        );
+
+        let duplicate = admit_request(&active, key.clone(), ActiveKind::Other)
+            .await
+            .expect("duplicate is rejected");
+        assert_eq!(duplicate.0, "duplicate_request_id");
+        assert!(matches!(
+            cancel_active(&active, &key).await,
+            CancelOutcome::Cancelled
+        ));
+        assert!(upload.is_cancelled());
+
+        active.lock().await.remove(&key);
+        assert!(
+            admit_request(&active, key, ActiveKind::Other)
+                .await
+                .is_none(),
+            "an ID is reusable after its terminal response"
+        );
     }
 
     #[tokio::test]
     async fn dispatcher_executes_requests_in_input_order() {
         let (output_tx, mut output_rx) = mpsc::channel(16);
         let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
-        let server_shutdown = CancellationToken::new();
         let (dispatch_tx, dispatch_rx) = mpsc::channel(16);
 
         // The first request is artificially slow; completion order must
@@ -1015,7 +1065,6 @@ mod tests {
                 dispatch_rx,
                 output_tx,
                 handler_active,
-                server_shutdown,
                 move |method, _params, _cancel| {
                     let slow = slow_first
                         .lock()
@@ -1060,43 +1109,5 @@ mod tests {
             .collect();
         assert_eq!(results, vec!["first", "second", "third"]);
         assert!(active.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn dispatcher_shutdown_request_cancels_server_token() {
-        let (output_tx, output_rx) = mpsc::channel(4);
-        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
-        let server_shutdown = CancellationToken::new();
-        let worker_shutdown = server_shutdown.clone();
-        let worker_active = Arc::clone(&active);
-        let (dispatch_tx, dispatch_rx) = mpsc::channel(4);
-        let dispatcher = tokio::spawn(async move {
-            run_dispatcher(
-                dispatch_rx,
-                output_tx,
-                worker_active,
-                worker_shutdown,
-                |_method, _, _| async { Ok(Value::Null) },
-            )
-            .await;
-        });
-
-        active
-            .lock()
-            .await
-            .insert(request_key(&Value::from("bye")), ActiveKind::Other);
-        dispatch_tx
-            .send(QueuedRequest {
-                id: Value::from("bye"),
-                method: "shutdown".to_owned(),
-                params: Value::Null,
-                upload_cancellation: None,
-            })
-            .await
-            .expect("dispatcher accepts request");
-        drop(dispatch_tx);
-        dispatcher.await.expect("dispatcher completes");
-        drop(output_rx);
-        assert!(server_shutdown.is_cancelled());
     }
 }

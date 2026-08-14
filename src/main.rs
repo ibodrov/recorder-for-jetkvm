@@ -30,44 +30,56 @@ async fn run_recording(config: &Config, controller: JetKvmController) -> Result<
     let detector_shutdown = shutdown_rx.clone();
     let detector_interval = Duration::from_millis(config.check_interval);
     let detector_sensitivity = config.sensitivity;
-    let mut detector_task = tokio::spawn(async move {
-        detector::run(
-            detector_nals,
-            change_tx,
-            detector_interval,
-            detector_sensitivity,
-            detector_shutdown,
-        )
-        .await;
-    });
+    let mut detector_task = tokio::spawn(detector::run(
+        detector_nals,
+        change_tx,
+        detector_interval,
+        detector_sensitivity,
+        detector_shutdown,
+    ));
 
     let recorder_nals = controller.subscribe_nals();
     let recorder_shutdown = shutdown_rx.clone();
     let output_directory = config.recordings_dir();
     let pre_buffer = config.pre_buffer;
     let cooldown = config.cooldown;
-    let mut recorder_task = tokio::spawn(async move {
-        recorder::run(
-            recorder_nals,
-            change_rx,
-            output_directory,
-            pre_buffer,
-            cooldown,
-            recorder_shutdown,
-        )
-        .await;
-    });
+    let mut recorder_task = tokio::spawn(recorder::run(
+        recorder_nals,
+        change_rx,
+        output_directory,
+        pre_buffer,
+        cooldown,
+        recorder_shutdown,
+    ));
 
-    tokio::signal::ctrl_c().await?;
-    info!("received shutdown signal");
+    enum Stop {
+        Signal(Result<()>),
+        Detector(std::result::Result<Result<()>, tokio::task::JoinError>),
+        Recorder(std::result::Result<Result<()>, tokio::task::JoinError>),
+    }
+
+    let stop = tokio::select! {
+        result = tokio::signal::ctrl_c() => Stop::Signal(result.map_err(Into::into)),
+        result = &mut detector_task => Stop::Detector(result),
+        result = &mut recorder_task => Stop::Recorder(result),
+    };
+    let (pipeline_result, detector_done, recorder_done) = match stop {
+        Stop::Signal(result) => {
+            result?;
+            info!("received shutdown signal");
+            (Ok(()), false, false)
+        }
+        Stop::Detector(result) => (worker_exit("detector", result), true, false),
+        Stop::Recorder(result) => (worker_exit("recorder", result), false, true),
+    };
+
     let _ = shutdown_tx.send(true);
-    controller.shutdown().await?;
-
+    let shutdown_result = controller.shutdown().await;
     let joined = tokio::time::timeout(Duration::from_secs(5), async {
-        if let Err(error) = (&mut detector_task).await {
+        if !detector_done && let Err(error) = (&mut detector_task).await {
             error!(%error, "detector task failed during shutdown");
         }
-        if let Err(error) = (&mut recorder_task).await {
+        if !recorder_done && let Err(error) = (&mut recorder_task).await {
             error!(%error, "recorder task failed during shutdown");
         }
     })
@@ -77,7 +89,19 @@ async fn run_recording(config: &Config, controller: JetKvmController) -> Result<
         detector_task.abort();
         recorder_task.abort();
     }
-    Ok(())
+    pipeline_result?;
+    shutdown_result
+}
+
+fn worker_exit(
+    name: &str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(Ok(())) => Err(anyhow!("{name} worker stopped unexpectedly")),
+        Ok(Err(error)) => Err(error).with_context(|| format!("{name} worker failed")),
+        Err(error) => Err(anyhow!("{name} worker task failed: {error}")),
+    }
 }
 
 /// connect() returns as soon as the actor is running; the WebRTC session
@@ -86,10 +110,10 @@ async fn run_recording(config: &Config, controller: JetKvmController) -> Result<
 async fn wait_for_connected(controller: &JetKvmController) -> Result<()> {
     use recorder_for_jetkvm::controller::{ConnectionState, ControllerEvent};
 
+    let mut events = controller.subscribe_events();
     if controller.status().await?.state == ConnectionState::Connected {
         return Ok(());
     }
-    let mut events = controller.subscribe_events();
     tokio::time::timeout(Duration::from_secs(60), async move {
         loop {
             match events.recv().await {

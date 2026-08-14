@@ -62,10 +62,12 @@ recorder-for-jetkvm serve --stdio \
   --password-file ~/.config/jetkvm-password
 ```
 
-The first request must be `hello`. Its result includes the protocol version, a
-machine-consumable capability list, firmware warnings, and the current
-controller status — no separate `status` round trip is needed. No events are
-emitted before the handshake response.
+The first request must be `hello`. Its result includes protocol version 2, the
+static sidecar method list, firmware warnings, and the current controller
+status — no separate `status` round trip is needed. Device-dependent support
+is reported separately in `status.device_capabilities`: `check_mount_url` is
+`null` while disconnected or unknown, then `true` or `false` for the active
+connection generation. No events are emitted before the handshake response.
 
 ```json
 {"id":1,"method":"hello","params":{"protocol_version":2}}
@@ -79,19 +81,24 @@ emitted before the handshake response.
 
 Responses reuse the request `id`; connection, takeover, media, and upload
 updates use an `event` field. Logs go to standard error only.
+Request IDs must be unique while a request is active. A duplicate is rejected
+with `duplicate_request_id` and a `null` response ID so the original request
+retains exactly one correlated terminal response. An ID may be reused after
+that response.
+
 
 ### Ordering and cancellation
 
-- Requests from one client are dispatched independently **except** HID
-  operations, media operations, storage operations, and snapshots, which form
-  a single ordered queue executed strictly in input order. `hello`, `status`,
-  and `cancel` bypass the queue and stay responsive while an upload runs.
+- State-changing operations form one ordered queue and execute in input order.
+  `status`, upload-only `cancel`, and `shutdown` use the control plane instead:
+  status reads a current snapshot, cancel remains reachable during an upload,
+  and shutdown preempts blocked work.
 - `cancel` targets **uploads only**: `{"method":"cancel","params":{"id":<upload request id>}}`.
   Cancelling any other request returns `not_cancellable`; a completed or
-  unknown id returns `invalid_params`. A cancelled upload stops at a real
-  transfer boundary; interrupting an upload leaves a resumable partial file on
-  the device (visible via `storage_files`), which a later upload of the same
-  image resumes automatically.
+  unknown ID returns `invalid_params`. A cancelled upload stops at a transfer
+  boundary and leaves a partial file on the device. Resume is allowed only in
+  the controller process that recorded the upload's full-source SHA-256
+  identity, and only when the complete local source still matches.
 
 ### Action receipts and fresh frames
 
@@ -111,10 +118,11 @@ strictly newer frame:
 ```
 
 A cursor from an older connection generation fails immediately with
-`stale_generation`. `type_text` resolves after the device reports the
-keyboard macro completed. Note: a newer frame proves the frame is fresher than
-the action boundary — it is not proof that an arbitrary UI operation
-completed.
+`stale_generation`. `type_text` accepts at most 4,096 characters in the
+supported US keyboard layout and resolves after the device reports the entire
+macro complete; its completion deadline covers the maximum encoded duration.
+A newer frame proves only that the frame is fresher than the action boundary,
+not that an arbitrary UI operation completed.
 
 ### Approvals
 
@@ -126,23 +134,25 @@ Without it they fail with `approval_required`.
 ### Shutdown
 
 Protocol `shutdown`, stdin EOF, SIGINT, and SIGTERM all run the same bounded
-cleanup: stop admitting work, cancel active uploads, reset HID, unmount and
-verify controller-owned media **before** the local range server stops, then
-close signaling, data channels, and the peer connection. The exit code is zero
-when cleanup succeeds.
+cleanup. They stop admission, cancel active uploads, interrupt blocked device
+work, reset HID, and unmount and verify controller-owned media **before** the
+local range server stops. Signaling, data channels, and the peer connection
+then close. A protocol shutdown response is emitted only after cleanup; the
+process exits successfully only when cleanup succeeds.
 
 Run `recorder-for-jetkvm --help` or
 `recorder-for-jetkvm serve --help` for all options.
 
 ## Runtime requirements
 
-The binary dynamically links the system FFmpeg libraries (libavcodec,
-libavformat, libavutil, and their codec dependencies) via `ffmpeg-the-third`
-with no optional crate features enabled. Install the distribution FFmpeg
-packages (FFmpeg 6.x–8.x are supported by the crate's bindings); on a minimal
-system, verify with `ldd $(which recorder-for-jetkvm)` that all shared
-libraries resolve. TLS is provided by the system OpenSSL (or platform
-equivalent) through `native-tls`.
+The binary dynamically links the system FFmpeg libraries used for codec,
+container, and image-scaling support (`libavcodec`, `libavformat`, `libavutil`,
+and `libswscale`). Unused device, filter, and software-resampling crate
+features are disabled. Install the distribution FFmpeg packages (FFmpeg
+6.x–8.x are supported by the crate's bindings); on a minimal system, verify
+with `ldd $(which recorder-for-jetkvm)` that every shared library resolves.
+TLS is provided by system OpenSSL (or the platform equivalent) through
+`native-tls`.
 
 ## Security
 

@@ -86,26 +86,26 @@ pub fn build_avcc_extradata(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     avcc
 }
 
-/// Convert a single Annex-B NAL unit to AVCC format (4-byte length prefix).
-#[must_use]
-pub fn nal_to_avcc(nal_data: &NalUnit) -> Vec<u8> {
-    let nals = split_annexb_nals(&nal_data.data);
-    let mut avcc = Vec::with_capacity(nal_data.data.len());
-
-    for nal in nals {
+fn append_nal_to_avcc(output: &mut Vec<u8>, nal_data: &NalUnit) {
+    for nal in split_annexb_nals(&nal_data.data) {
         if nal.is_empty() {
             continue;
         }
         let nal_type = nal[0] & 0x1F;
-        // Skip SPS/PPS in packet data (they go in extradata)
+        // SPS/PPS belong in stream extradata, not media samples.
         if nal_type == 7 || nal_type == 8 {
             continue;
         }
-        let len = nal.len() as u32;
-        avcc.extend_from_slice(&len.to_be_bytes());
-        avcc.extend_from_slice(nal);
+        output.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        output.extend_from_slice(nal);
     }
+}
 
+/// Convert a single Annex-B NAL unit to AVCC format (4-byte length prefix).
+#[must_use]
+pub fn nal_to_avcc(nal_data: &NalUnit) -> Vec<u8> {
+    let mut avcc = Vec::with_capacity(nal_data.data.len());
+    append_nal_to_avcc(&mut avcc, nal_data);
     avcc
 }
 
@@ -161,11 +161,46 @@ unsafe fn configure_h264_stream(
     Ok(())
 }
 
+#[derive(Debug)]
+struct AccessUnit {
+    rtp_timestamp: u32,
+    data: Vec<u8>,
+    is_keyframe: bool,
+}
+
+fn collect_access_unit(pending: &mut Option<AccessUnit>, nal: &NalUnit) -> Option<AccessUnit> {
+    if let Some(unit) = pending.as_mut()
+        && unit.rtp_timestamp == nal.rtp_timestamp
+    {
+        let previous_len = unit.data.len();
+        unit.data.reserve(nal.data.len());
+        append_nal_to_avcc(&mut unit.data, nal);
+        if unit.data.len() > previous_len {
+            unit.is_keyframe |= nal.is_keyframe;
+        }
+        return None;
+    }
+
+    let mut data = Vec::with_capacity(nal.data.len());
+    append_nal_to_avcc(&mut data, nal);
+    if data.is_empty() {
+        return None;
+    }
+    let completed = pending.take();
+    *pending = Some(AccessUnit {
+        rtp_timestamp: nal.rtp_timestamp,
+        data,
+        is_keyframe: nal.is_keyframe,
+    });
+    completed
+}
+
 struct Mp4Writer {
     output_ctx: ffmpeg_the_third::format::context::Output,
     stream_index: usize,
     stream_time_base: ffmpeg_the_third::Rational,
     first_rtp_ts: Option<u32>,
+    pending: Option<AccessUnit>,
     packet_count: u64,
     error_count: u64,
     finalized: bool,
@@ -216,6 +251,7 @@ impl Mp4Writer {
             stream_index,
             stream_time_base,
             first_rtp_ts: None,
+            pending: None,
             packet_count: 0,
             error_count: 0,
             finalized: false,
@@ -223,25 +259,24 @@ impl Mp4Writer {
     }
 
     fn write_nal(&mut self, nal: &NalUnit) -> Result<()> {
-        if self.packet_count == 0 && !nal.is_keyframe {
+        if let Some(unit) = collect_access_unit(&mut self.pending, nal) {
+            self.write_access_unit(unit)?;
+        }
+        Ok(())
+    }
+
+    fn write_access_unit(&mut self, unit: AccessUnit) -> Result<()> {
+        if self.packet_count == 0 && !unit.is_keyframe {
             warn!("first packet written is not a keyframe, video may have initial artifacts");
         }
-
-        // Convert from Annex-B to AVCC (also filters out SPS/PPS)
-        let avcc_data = nal_to_avcc(nal);
-        if avcc_data.is_empty() {
-            return Ok(());
-        }
-
-        let rtp_ts = nal.rtp_timestamp;
         if self.first_rtp_ts.is_none() {
-            self.first_rtp_ts = Some(rtp_ts);
+            self.first_rtp_ts = Some(unit.rtp_timestamp);
         }
 
-        let first_ts = self.first_rtp_ts.unwrap();
-        let rtp_offset = rtp_ts.wrapping_sub(first_ts) as i64;
-
-        // Rescale from RTP clock (1/90000) to the stream's effective time_base
+        let first_ts = self
+            .first_rtp_ts
+            .expect("first RTP timestamp is initialized");
+        let rtp_offset = unit.rtp_timestamp.wrapping_sub(first_ts) as i64;
         let tb = self.stream_time_base;
         let pts = if tb.numerator() > 0 && tb.denominator() > 0 {
             let num = rtp_offset as i128 * tb.denominator() as i128;
@@ -251,23 +286,21 @@ impl Mp4Writer {
             rtp_offset
         };
 
-        let mut packet = ffmpeg_the_third::codec::packet::Packet::copy(&avcc_data);
+        let mut packet = ffmpeg_the_third::codec::packet::Packet::copy(&unit.data);
         packet.set_pts(Some(pts));
         packet.set_dts(Some(pts));
         packet.set_stream(self.stream_index);
-
-        if nal.is_keyframe {
+        if unit.is_keyframe {
             packet.set_flags(ffmpeg_the_third::codec::packet::Flags::KEY);
         }
-
         packet
             .write_interleaved(&mut self.output_ctx)
             .with_context(|| {
-                let nal_type = nal.nal_type().unwrap_or(0);
                 format!(
-                    "write_interleaved failed: nal_type={nal_type} pts={pts} size={} keyframe={}",
-                    avcc_data.len(),
-                    nal.is_keyframe
+                    "write_interleaved failed: rtp_timestamp={} pts={pts} size={} keyframe={}",
+                    unit.rtp_timestamp,
+                    unit.data.len(),
+                    unit.is_keyframe
                 )
             })?;
 
@@ -280,6 +313,12 @@ impl Mp4Writer {
             return;
         }
         self.finalized = true;
+        if let Some(unit) = self.pending.take()
+            && let Err(error) = self.write_access_unit(unit)
+        {
+            self.error_count += 1;
+            error!(%error, "failed to flush final H.264 access unit");
+        }
 
         if self.packet_count == 0 {
             warn!("no video packets were written, skipping MP4 trailer");
@@ -310,11 +349,15 @@ pub async fn run(
     pre_buffer_secs: u64,
     cooldown_secs: u64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    if let Err(e) = tokio::fs::create_dir_all(&output_dir).await {
-        error!("failed to create output directory: {e}");
-        return;
-    }
+) -> Result<()> {
+    tokio::fs::create_dir_all(&output_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create output directory: {}",
+                output_dir.display()
+            )
+        })?;
 
     let pre_buffer_duration = Duration::from_secs(pre_buffer_secs);
     let cooldown_duration = Duration::from_secs(cooldown_secs);
@@ -398,8 +441,7 @@ pub async fn run(
                         warn!("recorder lagged, missed {n} NAL units");
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        debug!("NAL broadcast closed, recorder exiting");
-                        break;
+                        anyhow::bail!("recorder NAL stream closed unexpectedly");
                     }
                 }
             }
@@ -454,12 +496,15 @@ pub async fn run(
                 }
             }
 
-            _ = shutdown.changed() => {
+            changed = shutdown.changed() => {
+                if changed.is_err() && !*shutdown.borrow() {
+                    anyhow::bail!("recorder shutdown channel closed unexpectedly");
+                }
                 info!("shutdown signal, finalizing recording");
                 if let Some(mut w) = writer.take() {
                     w.finalize();
                 }
-                break;
+                return Ok(());
             }
         }
 
@@ -582,5 +627,108 @@ mod tests {
         let len = u32::from_be_bytes([avcc[0], avcc[1], avcc[2], avcc[3]]) as usize;
         assert_eq!(len, idr_data.len());
         assert_eq!(&avcc[4..], &idr_data[..]);
+    }
+
+    #[test]
+    fn groups_all_nals_with_one_rtp_timestamp_into_one_access_unit() {
+        fn nal(payload: &[u8], rtp_timestamp: u32, is_keyframe: bool) -> NalUnit {
+            let mut data = vec![0, 0, 0, 1];
+            data.extend_from_slice(payload);
+            NalUnit {
+                data: data.into(),
+                is_keyframe,
+                timestamp: Instant::now(),
+                rtp_timestamp,
+            }
+        }
+
+        let mut pending = None;
+        assert!(collect_access_unit(&mut pending, &nal(&[0x65, 0xAA], 90_000, true)).is_none());
+        assert!(collect_access_unit(&mut pending, &nal(&[0x06, 0xBB], 90_000, false)).is_none());
+        let completed = collect_access_unit(&mut pending, &nal(&[0x41, 0xCC], 93_000, false))
+            .expect("timestamp change completes an access unit");
+
+        assert_eq!(completed.rtp_timestamp, 90_000);
+        assert!(completed.is_keyframe);
+        assert_eq!(
+            completed.data,
+            vec![0, 0, 0, 2, 0x65, 0xAA, 0, 0, 0, 2, 0x06, 0xBB,]
+        );
+        assert_eq!(pending.expect("next access unit").rtp_timestamp, 93_000);
+    }
+
+    #[test]
+    fn multi_slice_fixture_produces_decodable_mp4_access_units() {
+        ffmpeg_the_third::init().expect("initialize FFmpeg");
+        let source = include_bytes!("../tests/fixtures/multi_slice.h264");
+        let nals = split_annexb_nals(source);
+        let mut parameter_sets = Vec::new();
+        for nal in &nals {
+            if matches!(nal.first().map(|byte| byte & 0x1F), Some(7 | 8)) {
+                parameter_sets.extend_from_slice(&[0, 0, 0, 1]);
+                parameter_sets.extend_from_slice(nal);
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let output = directory.path().join("multi-slice.mp4");
+        let mut writer = Mp4Writer::new(&output, &parameter_sets).expect("create MP4 writer");
+        let mut rtp_timestamp = 0_u32;
+        let mut saw_picture = false;
+        for nal in nals {
+            let nal_type = nal[0] & 0x1F;
+            if nal_type == 9 && saw_picture {
+                rtp_timestamp = rtp_timestamp.wrapping_add(45_000);
+                saw_picture = false;
+            }
+            saw_picture |= matches!(nal_type, 1 | 5);
+            let mut data = vec![0, 0, 0, 1];
+            data.extend_from_slice(nal);
+            writer
+                .write_nal(&NalUnit {
+                    data: data.into(),
+                    is_keyframe: nal_type == 5,
+                    timestamp: Instant::now(),
+                    rtp_timestamp,
+                })
+                .expect("write fixture NAL");
+        }
+        writer.finalize();
+        assert_eq!(writer.packet_count, 4, "one MP4 sample per access unit");
+        drop(writer);
+
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-count_frames",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "default=nokey=1:noprint_wrappers=1",
+            ])
+            .arg(&output)
+            .output()
+            .expect("run ffprobe");
+        assert!(
+            probe.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "4");
+
+        let decode = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args(["-f", "null", "-"])
+            .output()
+            .expect("run ffmpeg decoder");
+        assert!(
+            decode.status.success(),
+            "fixture MP4 failed to decode: {}",
+            String::from_utf8_lossy(&decode.stderr)
+        );
     }
 }

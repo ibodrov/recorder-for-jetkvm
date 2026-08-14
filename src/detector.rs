@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use anyhow::{Result, anyhow};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -27,23 +28,24 @@ pub async fn run(
     check_interval: Duration,
     sensitivity: f64,
     mut shutdown: watch::Receiver<bool>,
-) {
+) -> Result<()> {
     let mut last_check = Instant::now();
     let mut ref_size: Option<usize> = None;
     let mut max_p_size: usize = 0;
-    let mut nal_count: u64 = 0;
 
     debug!("change detector initialized (frame-size mode, sensitivity={sensitivity})");
 
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
+            changed = shutdown.changed() => {
+                if changed.is_err() && !*shutdown.borrow() {
+                    return Err(anyhow!("detector shutdown channel closed unexpectedly"));
+                }
                 info!("shutdown signal received, detector exiting");
-                break;
+                return Ok(());
             }
             recv_result = nal_rx.recv() => match recv_result {
             Ok(nal) => {
-                nal_count += 1;
 
                 // Use IDR frame size as the reference for "full screen of data"
                 if let Some(nal_type) = nal.nal_type()
@@ -102,14 +104,11 @@ pub async fn run(
                 warn!("detector lagged, missed {n} NAL units");
             }
             Err(broadcast::error::RecvError::Closed) => {
-                debug!("NAL broadcast closed, detector exiting");
-                break;
+                return Err(anyhow!("detector NAL stream closed unexpectedly"));
             }
             }
         }
     }
-
-    debug!("detector exiting (nal_count={nal_count})");
 }
 
 #[cfg(test)]
@@ -123,16 +122,13 @@ mod tests {
         let (change_tx, mut change_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let handle = tokio::spawn(async move {
-            run(
-                nal_rx,
-                change_tx,
-                Duration::from_millis(10),
-                0.02,
-                shutdown_rx,
-            )
-            .await;
-        });
+        let handle = tokio::spawn(run(
+            nal_rx,
+            change_tx,
+            Duration::from_millis(10),
+            0.02,
+            shutdown_rx,
+        ));
 
         shutdown_tx
             .send(true)
@@ -141,7 +137,8 @@ mod tests {
         timeout(Duration::from_secs(1), handle)
             .await
             .expect("detector task did not exit on shutdown")
-            .expect("detector task panicked");
+            .expect("detector task panicked")
+            .expect("detector returned an error during shutdown");
 
         assert!(matches!(
             change_rx.try_recv(),

@@ -92,12 +92,19 @@ pub struct ActionReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceCapabilities {
+    /// `null` while disconnected or before firmware support is known.
+    pub check_mount_url: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControllerStatus {
     pub connected: bool,
     pub state: ConnectionState,
     pub generation: u64,
     pub device_version: Option<String>,
     pub signaling: Option<String>,
+    pub device_capabilities: DeviceCapabilities,
     pub frame: Option<FrameStatus>,
     pub hid: Option<HidStatus>,
     pub stale_controller_mount: bool,
@@ -176,6 +183,8 @@ pub struct JetKvmController {
     event_tx: broadcast::Sender<ControllerEvent>,
     nal_tx: broadcast::Sender<NalUnit>,
     lifecycle: Arc<ControllerLifecycle>,
+    status: Arc<parking_lot::RwLock<ControllerStatus>>,
+    cache: LatestFrameCache,
 }
 
 struct ControllerLifecycle {
@@ -191,7 +200,6 @@ impl Drop for ControllerLifecycle {
 }
 
 enum Command {
-    Status(oneshot::Sender<Result<ControllerStatus>>),
     Connect(oneshot::Sender<Result<ControllerStatus>>),
     Disconnect(oneshot::Sender<Result<()>>),
     Snapshot {
@@ -346,6 +354,7 @@ struct Actor {
     media_event_tx: broadcast::Sender<MediaEvent>,
     shutdown: CancellationToken,
     error: Arc<parking_lot::Mutex<Option<String>>>,
+    status: Arc<parking_lot::RwLock<ControllerStatus>>,
     snapshot_directory: tempfile::TempDir,
     cache: LatestFrameCache,
     media: Option<VirtualMediaManager>,
@@ -375,6 +384,8 @@ impl Actor {
         channels: ActorChannels,
         shutdown: CancellationToken,
         error: Arc<parking_lot::Mutex<Option<String>>>,
+        status: Arc<parking_lot::RwLock<ControllerStatus>>,
+        cache: LatestFrameCache,
     ) -> Result<Self> {
         let snapshot_directory = tempfile::Builder::new()
             .prefix("recorder-for-jetkvm-")
@@ -397,8 +408,9 @@ impl Actor {
             media_event_tx,
             shutdown,
             error,
+            status,
             snapshot_directory,
-            cache: LatestFrameCache::new(),
+            cache,
             media: None,
             parameter_rx,
             parameter_sets: ParameterSets::default(),
@@ -428,7 +440,14 @@ impl Actor {
         }
     }
 
+    fn publish_status(&self, status: ControllerStatus) {
+        *self.status.write() = status;
+    }
+
     fn transition_event(&self, state: ConnectionState) {
+        if state != ConnectionState::Connected {
+            self.publish_status(self.offline_status(state));
+        }
         let _ = self.event_tx.send(ControllerEvent::ConnectionState {
             state,
             generation: self.generation,
@@ -481,9 +500,6 @@ impl Actor {
                         return self.shutdown_cleanup(None).await;
                     };
                     match command {
-                        Command::Status(response) => {
-                            let _ = response.send(Ok(self.offline_status(ConnectionState::Connecting)));
-                        }
                         Command::Connect(response) => waiters.push(response),
                         Command::Disconnect(response) => {
                             discard_attempt(attempt).await;
@@ -528,9 +544,6 @@ impl Actor {
                         return self.shutdown_cleanup(None).await;
                     };
                     match command {
-                        Command::Status(response) => {
-                            let _ = response.send(Ok(self.offline_status(ConnectionState::Reconnecting)));
-                        }
                         Command::Connect(response) => {
                             return self.start_attempt(vec![response]);
                         }
@@ -550,7 +563,7 @@ impl Actor {
 
     /// Serves `Disconnected` and `TakenOver`: no automatic reconnect; an
     /// explicit `connect` starts an attempt immediately.
-    async fn serve_offline(&mut self, state: ConnectionState) -> Phase {
+    async fn serve_offline(&mut self, _state: ConnectionState) -> Phase {
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => return self.shutdown_cleanup(None).await,
@@ -559,9 +572,6 @@ impl Actor {
                         return self.shutdown_cleanup(None).await;
                     };
                     match command {
-                        Command::Status(response) => {
-                            let _ = response.send(Ok(self.offline_status(state)));
-                        }
                         Command::Connect(response) => {
                             return self.start_attempt(vec![response]);
                         }
@@ -590,7 +600,7 @@ impl Actor {
                         return self.shutdown_cleanup(Some(connected)).await;
                     };
                     match command {
-                        Command::Status(response) | Command::Connect(response) => {
+                        Command::Connect(response) => {
                             let _ = response.send(Ok(self.connected_status(&connected)));
                         }
                         Command::Disconnect(response) => {
@@ -608,7 +618,9 @@ impl Actor {
                         }
                         command => {
                             match self.execute_connected(&mut connected, &mut end_watch, command).await {
-                                Interrupt::None => {}
+                                Interrupt::None => {
+                                    self.publish_status(self.connected_status(&connected));
+                                }
                                 Interrupt::Shutdown => {
                                     return self.shutdown_cleanup(Some(connected)).await;
                                 }
@@ -680,7 +692,7 @@ impl Actor {
             }};
         }
         match command {
-            Command::Status(_) | Command::Connect(_) | Command::Disconnect(_) => {
+            Command::Connect(_) | Command::Disconnect(_) => {
                 unreachable!("lifecycle commands are intercepted before execute_connected")
             }
             Command::Snapshot { after, response } => {
@@ -938,6 +950,7 @@ impl Actor {
         self.backoff = self.config.reconnect_min;
         self.last_error = None;
         let status = self.connected_status(&connected);
+        self.publish_status(status.clone());
         for waiter in waiters {
             let _ = waiter.send(Ok(status.clone()));
         }
@@ -1056,6 +1069,12 @@ impl Actor {
             state: ConnectionState::Connected,
             generation: self.generation,
             device_version: session.device_version().map(str::to_owned),
+            device_capabilities: DeviceCapabilities {
+                check_mount_url: self
+                    .media
+                    .as_ref()
+                    .map(VirtualMediaManager::supports_check_mount_url),
+            },
             signaling: Some(
                 match session.signaling_mode() {
                     SignalingMode::WebSocket => "websocket",
@@ -1106,6 +1125,9 @@ impl Actor {
             generation: self.generation,
             device_version: None,
             signaling: None,
+            device_capabilities: DeviceCapabilities {
+                check_mount_url: None,
+            },
             frame: None,
             hid: None,
             stale_controller_mount: self
@@ -1247,6 +1269,21 @@ impl JetKvmController {
         let shutdown = CancellationToken::new();
         let done = CancellationToken::new();
         let error = Arc::new(parking_lot::Mutex::new(None));
+        let status = Arc::new(parking_lot::RwLock::new(ControllerStatus {
+            connected: false,
+            state: ConnectionState::Connecting,
+            generation: 0,
+            device_version: None,
+            signaling: None,
+            device_capabilities: DeviceCapabilities {
+                check_mount_url: None,
+            },
+            frame: None,
+            hid: None,
+            stale_controller_mount: false,
+            last_error: None,
+        }));
+        let cache = LatestFrameCache::new();
         let lifecycle = Arc::new(ControllerLifecycle {
             shutdown: shutdown.clone(),
             done: done.clone(),
@@ -1280,6 +1317,8 @@ impl JetKvmController {
 
         let spawn_event_tx = event_tx.clone();
         let spawn_nal_tx = nal_tx.clone();
+        let actor_status = Arc::clone(&status);
+        let actor_cache = cache.clone();
         tokio::spawn(async move {
             match Actor::new(
                 config,
@@ -1292,6 +1331,8 @@ impl JetKvmController {
                 },
                 shutdown,
                 error,
+                actor_status,
+                actor_cache,
             ) {
                 Ok(actor) => {
                     let _ = ready_tx.send(Ok(()));
@@ -1312,6 +1353,8 @@ impl JetKvmController {
             event_tx,
             nal_tx,
             lifecycle,
+            status,
+            cache,
         })
     }
 
@@ -1324,7 +1367,18 @@ impl JetKvmController {
     }
 
     pub async fn status(&self) -> Result<ControllerStatus> {
-        request(&self.command_tx, Command::Status).await
+        let mut status = self.status.read().clone();
+        if status.connected {
+            status.frame = self.cache.info().map(|frame| FrameStatus {
+                age_ms: duration_millis(frame.age),
+                width: frame.width,
+                height: frame.height,
+                generation: frame.generation,
+                frame_id: frame.frame_id,
+                captured_at: format_system_time(frame.captured_at),
+            });
+        }
+        Ok(status)
     }
 
     pub async fn reconnect(&self) -> Result<ControllerStatus> {
@@ -1573,7 +1627,7 @@ fn reject_not_connected(command: Command) {
         Err(CodedError::new(codes::NOT_CONNECTED, "JetKVM is not connected").into())
     }
     match command {
-        Command::Status(response) | Command::Connect(response) => {
+        Command::Connect(response) => {
             let _ = response.send(not_connected());
         }
         Command::Disconnect(response)
@@ -1734,6 +1788,9 @@ mod tests {
             generation: 4,
             device_version: None,
             signaling: None,
+            device_capabilities: DeviceCapabilities {
+                check_mount_url: None,
+            },
             frame: None,
             hid: None,
             stale_controller_mount: false,
@@ -1777,8 +1834,31 @@ mod tests {
             .expect("status succeeds");
         assert_eq!(status.state, ConnectionState::Connecting);
         assert!(!status.connected);
+        assert_eq!(status.device_capabilities.check_mount_url, None);
         wait_for_attempts(&attempts, 1).await;
         controller.shutdown().await.expect("clean shutdown");
+    }
+    #[tokio::test]
+    async fn status_bypasses_a_pending_controller_request() {
+        let (connector, _attempts) = ScriptedConnector::new(vec![Script::Pending]);
+        let controller = JetKvmController::spawn(test_config(), connector)
+            .await
+            .expect("controller starts");
+        let reconnect_controller = controller.clone();
+        let reconnect = tokio::spawn(async move { reconnect_controller.reconnect().await });
+        tokio::task::yield_now().await;
+
+        let status = tokio::time::timeout(Duration::from_millis(100), controller.status())
+            .await
+            .expect("status stays prompt while reconnect is pending")
+            .expect("status succeeds");
+        assert_eq!(status.state, ConnectionState::Connecting);
+
+        controller.shutdown().await.expect("clean shutdown");
+        reconnect
+            .await
+            .expect("reconnect task joins")
+            .expect_err("pending reconnect is interrupted by shutdown");
     }
 
     #[tokio::test]

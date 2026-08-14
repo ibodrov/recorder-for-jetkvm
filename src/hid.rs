@@ -29,7 +29,7 @@ const TYPE_KEYBOARD_MACRO_STATE: u8 = 0x34;
 const KEY_SLOTS: usize = 6;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(50);
 const MACRO_COMPLETION_MARGIN: Duration = Duration::from_secs(1);
-const MACRO_COMPLETION_MAX: Duration = Duration::from_secs(30);
+const MACRO_COMPLETION_MAX: Duration = Duration::from_secs(120);
 const HID_ABSOLUTE_MAX: i32 = 32_767;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -904,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn macro_timeout_uses_encoded_delays_with_a_cap() {
+    fn macro_timeout_covers_every_accepted_encoded_delay() {
         assert_eq!(
             macro_completion_timeout(&[MacroStep {
                 modifier: 0,
@@ -913,6 +913,14 @@ mod tests {
             }]),
             Duration::from_millis(1_250)
         );
+        let maximum_text = "a".repeat(4096);
+        let maximum_steps =
+            crate::keyboard::text_to_macro(&maximum_text).expect("maximum text is accepted");
+        assert_eq!(
+            macro_completion_timeout(&maximum_steps),
+            Duration::from_millis(99_304)
+        );
+        assert!(macro_completion_timeout(&maximum_steps) < MACRO_COMPLETION_MAX);
         assert_eq!(
             macro_completion_timeout(&vec![
                 MacroStep {
@@ -920,7 +928,7 @@ mod tests {
                     keys: [0; KEY_SLOTS],
                     delay_ms: u16::MAX,
                 };
-                1_000
+                10_000
             ]),
             MACRO_COMPLETION_MAX
         );

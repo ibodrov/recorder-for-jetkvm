@@ -7,6 +7,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use reqwest::Body;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
@@ -107,6 +108,10 @@ impl VirtualMediaManager {
         self.peer_connection = peer_connection;
         self.auth = auth;
         self.supports_check_mount_url = supports_check_mount_url;
+    }
+
+    pub fn supports_check_mount_url(&self) -> bool {
+        self.supports_check_mount_url
     }
 
     pub fn has_stale_controller_mount(&self) -> bool {
@@ -236,6 +241,7 @@ impl VirtualMediaManager {
             server.shutdown().await?;
             return Err(error);
         }
+        self.range_server = Some(server);
         let state = match self
             .verified_state(|state| {
                 state.source == "HTTP"
@@ -246,16 +252,47 @@ impl VirtualMediaManager {
             .await
         {
             Ok(state) => state,
-            Err(error) => {
-                let _ = self.rpc.unmount().await;
-                server.shutdown().await?;
-                return Err(error).context("JetKVM did not report the controller-hosted mount");
+            Err(verification_error) => {
+                let rollback_result = async {
+                    self.rpc.unmount().await?;
+                    self.verified_unmounted().await
+                }
+                .await;
+                return self
+                    .complete_failed_local_mount(verification_error, rollback_result)
+                    .await;
             }
         };
-        server.ensure_healthy()?;
-        self.range_server = Some(server);
+        self.range_server
+            .as_ref()
+            .expect("range server retained after mount")
+            .ensure_healthy()?;
         self.stale_controller_mount = false;
         Ok(redact_state(state))
+    }
+    async fn complete_failed_local_mount(
+        &mut self,
+        verification_error: anyhow::Error,
+        rollback_result: Result<()>,
+    ) -> Result<VirtualMediaState> {
+        if let Err(rollback_error) = rollback_result {
+            self.stale_controller_mount = true;
+            let _ = self.events.send(MediaEvent::StaleControllerMount {
+                redacted_url: REDACTED_LOCAL_MEDIA_URL.to_owned(),
+            });
+            return Err(anyhow::anyhow!(
+                "JetKVM did not report the controller-hosted mount: \
+                 {verification_error:#}; rollback failed while the range server was \
+                 kept alive: {rollback_error:#}"
+            ));
+        }
+        if let Some(server) = self.range_server.take() {
+            server
+                .shutdown()
+                .await
+                .context("failed to stop the range server after mount rollback")?;
+        }
+        Err(verification_error).context("JetKVM did not report the controller-hosted mount")
     }
 
     pub async fn unmount(&mut self, approval: Approval) -> Result<()> {
@@ -280,12 +317,11 @@ impl VirtualMediaManager {
     /// Uploads a local image to device storage, resuming an interrupted
     /// upload when the device holds a partial with a matching origin.
     ///
-    /// Admission order (TO_FIX §6): validate inputs, obtain the resume
-    /// offset, verify the offset and the source identity, check free space
-    /// against the *remaining* bytes, transfer the remaining range, verify
-    /// the completed file. A partial upload is never deleted implicitly; a
-    /// partial whose origin is unknown or different is rejected so two
-    /// different images can never be spliced.
+    /// Admission order: validate inputs, hash the complete source, obtain and
+    /// validate the resume offset, verify the recorded source identity, check
+    /// free space against the remaining bytes, transfer that range, re-hash
+    /// the source, and verify the completed device file. Partials are never
+    /// deleted implicitly; unknown or different origins are rejected.
     pub async fn upload(
         &mut self,
         image: &Path,
@@ -311,7 +347,7 @@ impl VirtualMediaManager {
         if cancellation.is_cancelled() {
             return upload_cancelled("before disclosing the local image");
         }
-        let origin = read_upload_origin(&canonical).await?;
+        let origin = read_upload_origin(&canonical, &cancellation).await?;
 
         if cancellation.is_cancelled() {
             return upload_cancelled("before creating the upload");
@@ -332,7 +368,7 @@ impl VirtualMediaManager {
             already_uploaded = uploaded,
             "storage upload registered with JetKVM"
         );
-        self.verify_upload_origin(filename, origin, uploaded)?;
+        self.verify_upload_origin(filename, &origin, uploaded)?;
 
         let remaining = size - uploaded;
         if remaining > 0 {
@@ -390,6 +426,16 @@ impl VirtualMediaManager {
             }
         }
 
+        let completed_origin = read_upload_origin(&canonical, &cancellation).await?;
+        if completed_origin != origin {
+            return Err(CodedError::new(
+                codes::OPERATION_FAILED,
+                "upload source changed while it was being transferred; \
+                 the device partial is kept but cannot be resumed from this source",
+            )
+            .into());
+        }
+
         wait_for_storage_file(&self.rpc, filename, size, &cancellation).await
     }
 
@@ -417,15 +463,14 @@ impl VirtualMediaManager {
     }
 
     /// Origin check for resumed uploads. Fresh uploads (offset 0) record
-    /// their origin; resumes must match the recorded origin (size and
-    /// leading bytes) exactly.
+    /// their origin; resumes must match the recorded full-source digest.
     fn verify_upload_origin(
         &mut self,
         filename: &str,
-        origin: UploadOrigin,
+        origin: &UploadOrigin,
         uploaded: u64,
     ) -> Result<()> {
-        self.upload_origins.verify(filename, &origin, uploaded)
+        self.upload_origins.verify(filename, origin, uploaded)
     }
 
     pub async fn mount_storage(
@@ -557,17 +602,13 @@ fn validate_upload_offset(uploaded: u64, total: u64) -> Result<()> {
     Ok(())
 }
 
-/// Number of leading image bytes kept as an upload origin proof.
-const UPLOAD_ORIGIN_PREFIX_BYTES: usize = 4096;
-
-/// Best-available origin proof for a resumable upload: total size plus the
-/// leading bytes of the source image. Device-side partials without a
-/// matching proof are rejected rather than silently spliced onto a
-/// different image.
+/// Cryptographic identity for a resumable upload. The full source is hashed
+/// before transfer, and the same identity is checked again after transfer so
+/// equal-sized images with a shared prefix cannot be spliced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UploadOrigin {
     size: u64,
-    prefix: Bytes,
+    sha256: [u8; 32],
 }
 
 /// Per-filename origin proofs for uploads started by this controller. A
@@ -605,29 +646,38 @@ impl UploadOrigins {
     }
 }
 
-async fn read_upload_origin(path: &Path) -> Result<UploadOrigin> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .context("failed to inspect upload image")?;
+async fn read_upload_origin(path: &Path, cancellation: &CancellationToken) -> Result<UploadOrigin> {
     let mut file = tokio::fs::File::open(path)
         .await
         .context("failed to open upload image")?;
-    let mut prefix = vec![0_u8; UPLOAD_ORIGIN_PREFIX_BYTES];
-    let mut read = 0_usize;
+    let before = file
+        .metadata()
+        .await
+        .context("failed to inspect upload image")?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut hashed = 0_u64;
     loop {
-        let count = file
-            .read(&mut prefix[read..])
-            .await
-            .context("failed to read upload image")?;
+        let count = tokio::select! {
+            _ = cancellation.cancelled() => return upload_cancelled("while identifying the source"),
+            result = file.read(&mut buffer) => result.context("failed to read upload image")?,
+        };
         if count == 0 {
             break;
         }
-        read += count;
+        hasher.update(&buffer[..count]);
+        hashed = hashed.saturating_add(count as u64);
     }
-    prefix.truncate(read);
+    let after = file
+        .metadata()
+        .await
+        .context("failed to re-inspect upload image")?;
+    if before.len() != after.len() || hashed != before.len() {
+        bail!("upload source changed while its identity was being computed");
+    }
     Ok(UploadOrigin {
-        size: metadata.len(),
-        prefix: Bytes::from(prefix),
+        size: before.len(),
+        sha256: hasher.finalize().into(),
     })
 }
 
@@ -1119,15 +1169,27 @@ mod tests {
                             let request: Value =
                                 serde_json::from_slice(&message.data).expect("parse RPC request");
                             let id = request["id"].clone();
-                            let result = storage.respond(request).await;
+                            let response = if request["method"] == "checkMountUrl" {
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": {
+                                        "code": -32601,
+                                        "message": "not implemented",
+                                    },
+                                })
+                            } else {
+                                let result = storage.respond(request).await;
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": result,
+                                })
+                            };
                             response_channel
                                 .send_text(
-                                    serde_json::to_string(&json!({
-                                        "jsonrpc": "2.0",
-                                        "id": id,
-                                        "result": result,
-                                    }))
-                                    .expect("serialize RPC response"),
+                                    serde_json::to_string(&response)
+                                        .expect("serialize RPC response"),
                                 )
                                 .await
                                 .expect("send RPC response");
@@ -1223,7 +1285,7 @@ mod tests {
         let mut origins = UploadOrigins::default();
         let image_a = UploadOrigin {
             size: 10_000,
-            prefix: Bytes::from_static(b"image-a-prefix"),
+            sha256: [0xAA; 32],
         };
         // Fresh upload records its origin.
         origins
@@ -1236,7 +1298,7 @@ mod tests {
         // Same name and size but different content is rejected (no splice).
         let image_b = UploadOrigin {
             size: 10_000,
-            prefix: Bytes::from_static(b"image-b-prefix"),
+            sha256: [0xBB; 32],
         };
         let error = origins
             .verify("disk.iso", &image_b, 4096)
@@ -1254,6 +1316,75 @@ mod tests {
             .expect("fresh upload for another file records identity");
     }
 
+    #[tokio::test]
+    async fn upload_origin_hashes_bytes_beyond_a_shared_prefix() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first = directory.path().join("first.iso");
+        let second = directory.path().join("second.iso");
+        let mut first_bytes = vec![0_u8; 8192];
+        let mut second_bytes = first_bytes.clone();
+        first_bytes[7000] = 1;
+        second_bytes[7000] = 2;
+        tokio::fs::write(&first, first_bytes)
+            .await
+            .expect("write first image");
+        tokio::fs::write(&second, second_bytes)
+            .await
+            .expect("write second image");
+        let cancellation = CancellationToken::new();
+
+        let first_origin = read_upload_origin(&first, &cancellation)
+            .await
+            .expect("hash first image");
+        let second_origin = read_upload_origin(&second, &cancellation)
+            .await
+            .expect("hash second image");
+        assert_eq!(first_origin.size, second_origin.size);
+        assert_ne!(first_origin.sha256, second_origin.sha256);
+    }
+
+    #[tokio::test]
+    async fn failed_mount_rollback_keeps_the_range_server_alive() {
+        let mut harness = upload_harness(1, "unused.iso", 1, &[0]).await;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let image = directory.path().join("local.iso");
+        tokio::fs::write(&image, [0xAA])
+            .await
+            .expect("write local image");
+        let server = RangeServer::start(&image, harness.manager.auth.base_url())
+            .await
+            .expect("start range server");
+        harness.manager.range_server = Some(server);
+
+        let error = harness
+            .manager
+            .complete_failed_local_mount(
+                anyhow::anyhow!("mount verification failed"),
+                Err(anyhow::anyhow!("unmount failed")),
+            )
+            .await
+            .expect_err("rollback failure must be reported");
+        assert!(error.to_string().contains("rollback failed"));
+        assert!(harness.manager.stale_controller_mount);
+        assert!(
+            harness
+                .manager
+                .range_server
+                .as_ref()
+                .is_some_and(RangeServer::is_healthy),
+            "the mounted URL must remain serviceable after rollback failure"
+        );
+
+        harness
+            .manager
+            .range_server
+            .take()
+            .expect("retained range server")
+            .shutdown()
+            .await
+            .expect("stop range server");
+        harness.close().await;
+    }
     #[test]
     fn check_mount_url_unimplemented_is_classified() {
         let stub = anyhow::anyhow!("remote RPC error -32601: not implemented");
@@ -1262,6 +1393,22 @@ mod tests {
         assert!(is_check_mount_url_unimplemented(&method_missing));
         let other = anyhow::anyhow!("remote RPC error -32000: storage full");
         assert!(!is_check_mount_url_unimplemented(&other));
+    }
+
+    #[tokio::test]
+    async fn runtime_rpc_fallback_disables_check_mount_url_capability() {
+        let mut harness = upload_harness(1, "unused.iso", 1, &[0]).await;
+        harness.manager.supports_check_mount_url = true;
+        assert!(harness.manager.supports_check_mount_url());
+
+        let error = harness
+            .manager
+            .check_url("http://example.invalid/image.iso")
+            .await
+            .expect_err("stub RPC must trigger capability fallback");
+        assert!(error.to_string().contains("unsupported"));
+        assert!(!harness.manager.supports_check_mount_url());
+        harness.close().await;
     }
 
     #[test]
