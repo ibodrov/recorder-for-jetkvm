@@ -1,23 +1,32 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::paths;
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum CliCommand {
+    /// Run the persistent controller protocol server.
+    Serve {
+        /// Read NDJSON requests from stdin and write responses to stdout.
+        #[arg(long)]
+        stdio: bool,
+    },
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "recorder-for-jetkvm", about = "Record JetKVM screen changes")]
 pub struct Config {
     /// JetKVM host address (e.g. 192.168.1.130)
-    #[arg(long)]
+    #[arg(long, global = true, default_value = "")]
     pub host: String,
 
     /// JetKVM local password (prefer JETKVM_PASSWORD env var or --password-file instead)
-    #[arg(long, env = "JETKVM_PASSWORD")]
+    #[arg(long, env = "JETKVM_PASSWORD", global = true)]
     pub password: Option<String>,
 
     /// Path to a file containing the JetKVM password
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub password_file: Option<PathBuf>,
 
     /// Directory to store recorded MP4 files (default: your OS video directory)
@@ -41,11 +50,11 @@ pub struct Config {
     pub check_interval: u64,
 
     /// Interval between PLI (keyframe request) messages in seconds
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 3, global = true)]
     pub pli_interval: u64,
 
     /// Accept invalid TLS certificates (for self-signed certs)
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, global = true)]
     pub no_tls_verify: bool,
 
     /// Capture a single screenshot and exit
@@ -55,6 +64,9 @@ pub struct Config {
     /// Path to write the screenshot PNG (default: your OS pictures directory)
     #[arg(long)]
     pub screenshot_output: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: Option<CliCommand>,
 }
 
 fn parse_sensitivity(input: &str) -> std::result::Result<f64, String> {
@@ -88,11 +100,11 @@ impl Config {
 
     /// Resolve the password from CLI arg, env var (handled by clap), or password file.
     pub fn resolve_password(&self) -> Result<String> {
-        if let Some(ref password) = self.password {
+        if let Some(password) = &self.password {
             return Ok(password.clone());
         }
 
-        if let Some(ref path) = self.password_file {
+        if let Some(path) = &self.password_file {
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read password file: {}", path.display()))?;
             let password = contents.trim().to_string();
@@ -105,6 +117,16 @@ impl Config {
         anyhow::bail!(
             "no password provided; use --password, JETKVM_PASSWORD env var, or --password-file"
         )
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.host.trim().is_empty() {
+            anyhow::bail!("--host is required");
+        }
+        if matches!(self.command, Some(CliCommand::Serve { stdio: false })) {
+            anyhow::bail!("serve currently requires --stdio");
+        }
+        Ok(())
     }
 }
 
@@ -152,7 +174,10 @@ mod tests {
         .expect("expected explicit output paths to parse");
 
         assert_eq!(cfg.recordings_dir(), PathBuf::from("/tmp/recordings"));
-        assert_eq!(cfg.screenshot_output_path(), PathBuf::from("/tmp/capture.png"));
+        assert_eq!(
+            cfg.screenshot_output_path(),
+            PathBuf::from("/tmp/capture.png")
+        );
     }
 
     #[test]
@@ -203,5 +228,42 @@ mod tests {
                 "unexpected clap error for --sensitivity={raw}: {message}"
             );
         }
+    }
+
+    #[test]
+    fn validation_requires_host_for_every_mode() {
+        let config = Config::try_parse_from(["recorder-for-jetkvm", "serve", "--stdio"])
+            .expect("serve arguments should parse");
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "--host is required"
+        );
+    }
+
+    #[test]
+    fn serve_requires_explicit_stdio_transport() {
+        let config =
+            Config::try_parse_from(["recorder-for-jetkvm", "serve", "--host", "192.168.1.130"])
+                .expect("serve arguments should parse");
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("--stdio")
+        );
+    }
+
+    #[test]
+    fn serve_stdio_accepts_global_options_after_subcommand() {
+        let config = Config::try_parse_from([
+            "recorder-for-jetkvm",
+            "serve",
+            "--stdio",
+            "--host",
+            "192.168.1.130",
+        ])
+        .expect("serve arguments should parse");
+        config.validate().expect("serve --stdio should validate");
     }
 }

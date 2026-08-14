@@ -161,7 +161,7 @@ fn maybe_capture_access_unit(
         let mut decoded = ffmpeg_the_third::frame::Video::empty();
         match decoder.receive_frame(&mut decoded) {
             Ok(()) => {
-                encode_png(&decoded, output_path)?;
+                encode_png_atomic(&decoded, output_path)?;
                 info!(
                     path = %output_path.display(),
                     width = decoded.width(),
@@ -212,7 +212,10 @@ fn build_decoder_packet(
     packet
 }
 
-fn encode_png(frame: &ffmpeg_the_third::frame::Video, output_path: &Path) -> Result<()> {
+pub(crate) fn encode_png_atomic(
+    frame: &ffmpeg_the_third::frame::Video,
+    output_path: &Path,
+) -> Result<()> {
     let mut rgb_frame = ffmpeg_the_third::frame::Video::new(
         ffmpeg_the_third::format::Pixel::RGB24,
         frame.width(),
@@ -236,13 +239,13 @@ fn encode_png(frame: &ffmpeg_the_third::frame::Video, output_path: &Path) -> Res
     encoder.set_format(ffmpeg_the_third::format::Pixel::RGB24);
     encoder.set_time_base(ffmpeg_the_third::Rational(1, 1));
 
-    let mut encoder = encoder.open_as(codec).context("failed to open PNG encoder")?;
+    let mut encoder = encoder
+        .open_as(codec)
+        .context("failed to open PNG encoder")?;
     encoder
         .send_frame(&rgb_frame)
         .context("failed to send RGB frame to PNG encoder")?;
-    encoder
-        .send_eof()
-        .context("failed to flush PNG encoder")?;
+    encoder.send_eof().context("failed to flush PNG encoder")?;
 
     let mut packet = ffmpeg_the_third::Packet::empty();
     loop {
@@ -252,14 +255,26 @@ fn encode_png(frame: &ffmpeg_the_third::frame::Video, output_path: &Path) -> Res
                     .data()
                     .ok_or_else(|| anyhow!("PNG encoder returned an empty packet"))?;
 
-                if let Some(parent) = output_path.parent() {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("failed to create screenshot directory: {}", parent.display())
-                    })?;
-                }
-
-                std::fs::write(output_path, data).with_context(|| {
-                    format!("failed to write screenshot: {}", output_path.display())
+                let parent = output_path
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to create screenshot directory: {}",
+                        parent.display()
+                    )
+                })?;
+                let temporary = tempfile::NamedTempFile::new_in(parent)
+                    .context("failed to create temporary screenshot")?;
+                std::fs::write(temporary.path(), data)
+                    .context("failed to write temporary screenshot")?;
+                temporary.persist(output_path).map_err(|err| {
+                    anyhow!(
+                        "failed to atomically publish screenshot {}: {}",
+                        output_path.display(),
+                        err.error
+                    )
                 })?;
                 return Ok(());
             }

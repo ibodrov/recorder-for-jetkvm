@@ -2,6 +2,7 @@
 name = "recorder-for-jetkvm"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 authors = ["Ivan Bodrov <ibodrov@gmail.com>"]
 description = "JetKVM recorder and screenshot utility"
 documentation = "https://docs.rs/recorder-for-jetkvm"
@@ -13,7 +14,7 @@ repository = "https://github.com/ibodrov/recorder-for-jetkvm"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 webrtc = "0.17"
-reqwest = { version = "0.12", features = ["cookies", "json"] }
+reqwest = { version = "0.12", features = ["cookies", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -25,3 +26,10 @@ chrono = "0.4"
 anyhow = "1"
 bytes = "1"
 directories = "6"
+futures-util = { version = "0.3", features = ["sink"] }
+native-tls = "0.2"
+rand = "0.9"
+tempfile = "3"
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+parking_lot = "0.12"

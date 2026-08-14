@@ -20,6 +20,8 @@ After that, the `recorder-for-jetkvm` binary should be available in your Cargo b
 
 ## Build From Source
 
+Rust 1.88 or newer is required.
+
 ```bash
 cargo build --release
 ```
@@ -65,9 +67,60 @@ For the full option list:
 recorder-for-jetkvm --help
 ```
 
+## Persistent controller protocol
+
+`serve --stdio` keeps one WebRTC session alive for repeated observation, HID input,
+typed device RPC, and virtual-media operations:
+
+```bash
+recorder-for-jetkvm serve --stdio \
+  --host 192.168.1.130 \
+  --password-file ~/.config/jetkvm-password
+```
+
+The protocol is newline-delimited JSON on standard input and output. Logs go to
+standard error. The first request must negotiate protocol version 1:
+
+```json
+{"id":1,"method":"hello","params":{"protocol_version":1}}
+{"id":2,"method":"status","params":{}}
+{"id":3,"method":"snapshot","params":{"path":"/tmp/jetkvm.png"}}
+{"id":4,"method":"shutdown","params":{}}
+```
+
+Responses carry the matching `id`; asynchronous connection, takeover, and upload
+progress messages carry an `event` field. Request IDs are strings or integers.
+Use `cancel` with the target request ID to cancel an in-flight operation.
+Mutating virtual-media methods require `"approved":true`; callers should set it
+only after explicit user approval. Device firmware can report individual methods
+as `unsupported`.
+
+The controller prefers current WebSocket signaling and falls back to the legacy
+HTTP offer/answer endpoint. Each replacement connection has a monotonically
+increasing generation. Cached frames and pending RPC responses never cross
+generations.
+
+Local image mounting starts a tokenized, single-file HTTP range server bound only
+to the interface used to reach the JetKVM. Device-storage uploads are resumable,
+cancellable, and validated against free space before transfer.
+
+## Security
+
+- Plain HTTP sends the JetKVM password and session cookie without transport
+  encryption. Use it only on a trusted LAN; prefer HTTPS.
+- `--no-tls-verify` disables certificate authentication. Use it only for a
+  device certificate you have verified by another channel.
+- The stdio peer can request HID actions and reads of explicitly named local
+  image paths. Run the controller only as the intended desktop user and treat
+  the parent process as trusted.
+- Controller output redacts authentication headers, upload IDs, and local range
+  tokens. Do not forward device or FFmpeg debug logs to untrusted consumers.
+- `ffmpeg-the-third` links the system FFmpeg libraries. Binary distributors must
+  comply with the licenses of the exact FFmpeg build and enabled codecs they
+  ship; GPL-enabled FFmpeg builds can impose GPL distribution obligations.
+
 ## Notes
 
-- Use `--no-tls-verify` if your JetKVM is using a self-signed certificate.
 - Screenshot filenames default to `recorder-for-jetkvm_YYYY-MM-DD_HH-MM-SS.png`.
 
 ## AI Note

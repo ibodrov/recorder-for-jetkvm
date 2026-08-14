@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::Client;
+use reqwest::cookie::CookieStore;
+use reqwest::header::HeaderValue;
+use reqwest::{Client, Url};
 use tracing::{info, warn};
 
 /// Default timeout for HTTP requests to the JetKVM device.
@@ -18,8 +20,38 @@ pub fn base_url(host: &str) -> String {
         format!("http://{host}")
     }
 }
+#[derive(Clone)]
+pub struct AuthenticatedClient {
+    client: Client,
+    cookie_jar: Arc<reqwest::cookie::Jar>,
+    base_url: String,
+    no_tls_verify: bool,
+}
 
-pub async fn login(host: &str, password: &str, no_tls_verify: bool) -> Result<Client> {
+impl AuthenticatedClient {
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn no_tls_verify(&self) -> bool {
+        self.no_tls_verify
+    }
+
+    pub fn cookie_header(&self) -> Result<Option<HeaderValue>> {
+        let url = Url::parse(&self.base_url).context("invalid JetKVM base URL")?;
+        Ok(self.cookie_jar.cookies(&url))
+    }
+}
+
+pub async fn authenticate(
+    host: &str,
+    password: &str,
+    no_tls_verify: bool,
+) -> Result<AuthenticatedClient> {
     let base = base_url(host);
     let url = format!("{base}/auth/login-local");
 
@@ -27,9 +59,9 @@ pub async fn login(host: &str, password: &str, no_tls_verify: bool) -> Result<Cl
         warn!("sending credentials over plaintext HTTP — use only on trusted local networks");
     }
 
-    let jar = Arc::new(reqwest::cookie::Jar::default());
+    let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
     let mut builder = Client::builder()
-        .cookie_provider(jar)
+        .cookie_provider(Arc::clone(&cookie_jar))
         .timeout(HTTP_TIMEOUT)
         .connect_timeout(HTTP_TIMEOUT);
 
@@ -39,20 +71,30 @@ pub async fn login(host: &str, password: &str, no_tls_verify: bool) -> Result<Cl
     }
 
     let client = builder.build().context("failed to build HTTP client")?;
-
     let resp = client
         .post(&url)
         .json(&serde_json::json!({"password": password}))
         .send()
         .await
-        .context("failed to send auth request")?;
+        .context("failed to send authentication request")?;
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("authentication failed (HTTP {status}): {body}");
+        anyhow::bail!("authentication failed (HTTP {status})");
     }
 
     info!("authenticated with JetKVM at {base}");
-    Ok(client)
+    Ok(AuthenticatedClient {
+        client,
+        cookie_jar,
+        base_url: base,
+        no_tls_verify,
+    })
+}
+
+pub async fn login(host: &str, password: &str, no_tls_verify: bool) -> Result<Client> {
+    Ok(authenticate(host, password, no_tls_verify)
+        .await?
+        .client
+        .clone())
 }
