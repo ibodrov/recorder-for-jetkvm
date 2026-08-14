@@ -7,15 +7,96 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::rtp::packet::Packet;
-use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+use webrtc::rtp_transceiver::RTCPFeedback;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+};
 use webrtc::track::track_remote::TrackRemote;
 
 use crate::signaling;
+const H264_PROFILES: &[(u8, &str)] = &[
+    (
+        102,
+        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
+    ),
+    (
+        127,
+        "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f",
+    ),
+    (
+        125,
+        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+    ),
+    (
+        108,
+        "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f",
+    ),
+    (
+        123,
+        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032",
+    ),
+    (
+        118,
+        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640028",
+    ),
+    (
+        119,
+        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640029",
+    ),
+    (
+        120,
+        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64002a",
+    ),
+    (
+        121,
+        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640033",
+    ),
+];
+
+fn register_h264_codecs(media_engine: &mut MediaEngine) -> Result<()> {
+    let rtcp_feedback = vec![
+        RTCPFeedback {
+            typ: "goog-remb".to_owned(),
+            parameter: String::new(),
+        },
+        RTCPFeedback {
+            typ: "ccm".to_owned(),
+            parameter: "fir".to_owned(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_owned(),
+            parameter: String::new(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_owned(),
+            parameter: "pli".to_owned(),
+        },
+    ];
+
+    for &(payload_type, sdp_fmtp_line) in H264_PROFILES {
+        media_engine.register_codec(
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_H264.to_owned(),
+                    clock_rate: 90_000,
+                    channels: 0,
+                    sdp_fmtp_line: sdp_fmtp_line.to_owned(),
+                    rtcp_feedback: rtcp_feedback.clone(),
+                },
+                payload_type,
+                ..Default::default()
+            },
+            RTPCodecType::Video,
+        )?;
+    }
+
+    Ok(())
+}
 
 #[derive(Debug)]
 pub struct ConnectionLostError;
@@ -40,7 +121,7 @@ pub async fn run(
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut media_engine = MediaEngine::default();
-    media_engine.register_default_codecs()?;
+    register_h264_codecs(&mut media_engine)?;
 
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)?;
@@ -187,5 +268,51 @@ pub async fn run(
             peer_connection.close().await?;
             anyhow::bail!(ConnectionLostError)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn offer_advertises_only_h264_video() {
+        let mut media_engine = MediaEngine::default();
+        register_h264_codecs(&mut media_engine).expect("expected H.264 codecs to register");
+
+        let mut registry = Registry::new();
+        registry = register_default_interceptors(registry, &mut media_engine)
+            .expect("expected interceptors to register");
+
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .build();
+        let peer_connection = api
+            .new_peer_connection(RTCConfiguration::default())
+            .await
+            .expect("expected peer connection to be created");
+        peer_connection
+            .add_transceiver_from_kind(RTPCodecType::Video, None)
+            .await
+            .expect("expected video transceiver to be added");
+
+        let offer = peer_connection
+            .create_offer(None)
+            .await
+            .expect("expected SDP offer");
+
+        assert!(offer.sdp.contains("H264/90000"));
+        for unsupported_codec in ["VP8/90000", "VP9/90000", "AV1/90000", "H265/90000"] {
+            assert!(
+                !offer.sdp.contains(unsupported_codec),
+                "offer unexpectedly advertises {unsupported_codec}"
+            );
+        }
+
+        peer_connection
+            .close()
+            .await
+            .expect("expected peer connection to close");
     }
 }
