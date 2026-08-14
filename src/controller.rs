@@ -59,6 +59,26 @@ impl fmt::Debug for ConnectionConfig {
     }
 }
 
+impl ConnectionConfig {
+    fn validate(&self) -> Result<()> {
+        if self.pli_interval.is_zero() {
+            return Err(anyhow!("PLI interval must be greater than zero"));
+        }
+        if self.reconnect_min.is_zero() {
+            return Err(anyhow!("minimum reconnect delay must be greater than zero"));
+        }
+        if self.reconnect_max.is_zero() {
+            return Err(anyhow!("maximum reconnect delay must be greater than zero"));
+        }
+        if self.reconnect_min > self.reconnect_max {
+            return Err(anyhow!(
+                "minimum reconnect delay must not exceed maximum reconnect delay"
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
@@ -188,23 +208,29 @@ pub struct JetKvmController {
     cache: LatestFrameCache,
 }
 
-#[derive(Clone)]
 struct LiveHidStatus {
     generation: u64,
-    read: Arc<dyn Fn() -> HidStatus + Send + Sync>,
+    client: crate::hid::HidClient,
 }
 
 impl LiveHidStatus {
     fn new(generation: u64, client: crate::hid::HidClient) -> Self {
-        Self {
-            generation,
-            read: Arc::new(move || client.status()),
-        }
+        Self { generation, client }
     }
 
     fn status(&self) -> HidStatus {
-        (self.read)()
+        self.client.status()
     }
+}
+
+fn apply_live_hid_status(status: &mut ControllerStatus, live_hid: Option<(u64, HidStatus)>) {
+    status.hid = if status.connected {
+        live_hid
+            .filter(|(generation, _)| *generation == status.generation)
+            .map(|(_, hid)| hid)
+    } else {
+        None
+    };
 }
 
 struct ControllerLifecycle {
@@ -399,6 +425,7 @@ struct ActorChannels {
     media_event_tx: broadcast::Sender<MediaEvent>,
 }
 
+#[derive(Clone)]
 struct ActorShared {
     shutdown: CancellationToken,
     error: Arc<parking_lot::Mutex<Option<String>>>,
@@ -406,6 +433,53 @@ struct ActorShared {
     status: Arc<parking_lot::RwLock<ControllerStatus>>,
     live_hid: Arc<parking_lot::RwLock<Option<LiveHidStatus>>>,
     cache: LatestFrameCache,
+}
+
+fn supervise_actor_task(
+    actor_task: tokio::task::JoinHandle<()>,
+    shared: ActorShared,
+    event_tx: broadcast::Sender<ControllerEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Err(join_error) = actor_task.await else {
+            return;
+        };
+        let message = if join_error.is_panic() {
+            "controller actor panicked"
+        } else {
+            "controller actor stopped unexpectedly"
+        }
+        .to_owned();
+
+        shared.live_hid.write().take();
+        shared.cache.clear();
+        *shared.error.lock() = Some(message.clone());
+        let generation = {
+            let mut status = shared.status.write();
+            let generation = status.generation;
+            *status = ControllerStatus {
+                connected: false,
+                state: ConnectionState::ShuttingDown,
+                generation,
+                device_version: None,
+                signaling: None,
+                device_capabilities: DeviceCapabilities {
+                    check_mount_url: None,
+                },
+                frame: None,
+                hid: None,
+                stale_controller_mount: false,
+                last_error: Some(message.clone()),
+            };
+            generation
+        };
+        let _ = event_tx.send(ControllerEvent::ConnectionState {
+            state: ConnectionState::ShuttingDown,
+            generation,
+            last_error: Some(message),
+        });
+        shared.done.cancel();
+    })
 }
 
 impl Actor {
@@ -533,7 +607,10 @@ impl Actor {
     fn start_reconnect(&mut self) -> Phase {
         self.transition_event(ConnectionState::Reconnecting);
         let wake = Box::pin(tokio::time::sleep(self.backoff));
-        self.backoff = (self.backoff * 2).min(self.config.reconnect_max);
+        self.backoff = self
+            .backoff
+            .saturating_mul(2)
+            .min(self.config.reconnect_max);
         Phase::Reconnecting { wake }
     }
 
@@ -1351,6 +1428,7 @@ impl JetKvmController {
     }
 
     async fn spawn(config: ConnectionConfig, connector: Arc<dyn Connector>) -> Result<Self> {
+        config.validate()?;
         let (command_tx, command_rx) = mpsc::channel(COMMAND_BUFFER);
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
         let (nal_tx, _) = broadcast::channel(NAL_BUFFER);
@@ -1408,10 +1486,17 @@ impl JetKvmController {
 
         let spawn_event_tx = event_tx.clone();
         let spawn_nal_tx = nal_tx.clone();
-        let actor_status = Arc::clone(&status);
-        let actor_live_hid = Arc::clone(&live_hid);
-        let actor_cache = cache.clone();
-        tokio::spawn(async move {
+        let actor_shared = ActorShared {
+            shutdown,
+            error,
+            done: done.clone(),
+            status: Arc::clone(&status),
+            live_hid: Arc::clone(&live_hid),
+            cache: cache.clone(),
+        };
+        let supervisor_shared = actor_shared.clone();
+        let actor_done = done.clone();
+        let actor_task = tokio::spawn(async move {
             match Actor::new(
                 config,
                 connector,
@@ -1421,14 +1506,7 @@ impl JetKvmController {
                     nal_tx: spawn_nal_tx,
                     media_event_tx,
                 },
-                ActorShared {
-                    shutdown,
-                    error,
-                    done: done.clone(),
-                    status: actor_status,
-                    live_hid: actor_live_hid,
-                    cache: actor_cache,
-                },
+                actor_shared,
             ) {
                 Ok(actor) => {
                     let _ = ready_tx.send(Ok(()));
@@ -1438,8 +1516,9 @@ impl JetKvmController {
                     let _ = ready_tx.send(Err(error));
                 }
             }
-            done.cancel();
+            actor_done.cancel();
         });
+        supervise_actor_task(actor_task, supervisor_shared, event_tx.clone());
 
         ready_rx
             .await
@@ -1481,16 +1560,16 @@ impl JetKvmController {
                     frame_id: frame.frame_id,
                     captured_at: format_system_time(frame.captured_at),
                 });
-            let hid = self
-                .live_hid
-                .read()
-                .as_ref()
-                .filter(|live| live.generation == status.generation)
-                .cloned();
-            status.hid = hid.map(|live| live.status());
+            let live_hid = self.live_hid.read();
+            apply_live_hid_status(
+                &mut status,
+                live_hid
+                    .as_ref()
+                    .map(|live| (live.generation, live.status())),
+            );
         } else {
             status.frame = None;
-            status.hid = None;
+            apply_live_hid_status(&mut status, None);
         }
         Ok(status)
     }
@@ -1918,20 +1997,7 @@ mod tests {
         }
     }
 
-    fn live_hid_source(
-        generation: u64,
-        status: Arc<parking_lot::RwLock<HidStatus>>,
-    ) -> LiveHidStatus {
-        LiveHidStatus {
-            generation,
-            read: Arc::new(move || *status.read()),
-        }
-    }
-
-    fn status_controller(
-        status: ControllerStatus,
-        live_hid: Option<LiveHidStatus>,
-    ) -> JetKvmController {
+    fn status_controller(status: ControllerStatus) -> JetKvmController {
         let (command_tx, _) = mpsc::channel(1);
         let (event_tx, _) = broadcast::channel(1);
         let (nal_tx, _) = broadcast::channel(1);
@@ -1945,7 +2011,7 @@ mod tests {
                 error: Arc::new(parking_lot::Mutex::new(None)),
             }),
             status: Arc::new(parking_lot::RwLock::new(status)),
-            live_hid: Arc::new(parking_lot::RwLock::new(live_hid)),
+            live_hid: Arc::new(parking_lot::RwLock::new(None)),
             cache: LatestFrameCache::new(),
         }
     }
@@ -1967,10 +2033,7 @@ mod tests {
             let (nal_tx, _) = broadcast::channel(1);
             let (media_event_tx, _) = broadcast::channel(1);
             let status = Arc::new(parking_lot::RwLock::new(connected_test_status(generation)));
-            let hid = Arc::new(parking_lot::RwLock::new(test_hid_status(1, 1, 0, true)));
-            let live_hid = Arc::new(parking_lot::RwLock::new(Some(live_hid_source(
-                generation, hid,
-            ))));
+            let live_hid = Arc::new(parking_lot::RwLock::new(None));
             let error = Arc::new(parking_lot::Mutex::new(None));
             let done = CancellationToken::new();
             let mut actor = Actor::new(
@@ -2009,7 +2072,7 @@ mod tests {
             done: CancellationToken,
         ) -> JetKvmController {
             let snapshot = status.read().clone();
-            let mut controller = status_controller(snapshot, None);
+            let mut controller = status_controller(snapshot);
             controller.status = status;
             controller.live_hid = live_hid;
             controller.lifecycle = Arc::new(ControllerLifecycle {
@@ -2058,6 +2121,26 @@ mod tests {
     }
 
     #[test]
+    fn connection_config_rejects_invalid_timing() {
+        let mut config = test_config();
+        config.pli_interval = Duration::ZERO;
+        assert!(config.validate().is_err());
+
+        let mut config = test_config();
+        config.reconnect_min = Duration::ZERO;
+        assert!(config.validate().is_err());
+
+        let mut config = test_config();
+        config.reconnect_max = Duration::ZERO;
+        assert!(config.validate().is_err());
+
+        let mut config = test_config();
+        config.reconnect_min = Duration::from_secs(2);
+        config.reconnect_max = Duration::from_secs(1);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn offline_status_has_no_stale_generation_data() {
         let status = ControllerStatus {
             connected: false,
@@ -2080,117 +2163,42 @@ mod tests {
         assert_eq!(status.last_error.as_deref(), Some("boom"));
     }
 
-    #[tokio::test]
-    async fn status_reads_live_hid_changes_instead_of_cached_command_status() {
-        let hid = Arc::new(parking_lot::RwLock::new(test_hid_status(1, 0, 0, true)));
-        let controller = status_controller(
-            connected_test_status(4),
-            Some(live_hid_source(4, Arc::clone(&hid))),
-        );
-
-        let status = controller.status().await.expect("initial status");
+    #[test]
+    fn live_hid_status_replaces_cached_command_status() {
+        let mut status = connected_test_status(4);
+        apply_live_hid_status(&mut status, Some((4, test_hid_status(1, 0, 0, true))));
         assert_eq!(status.hid.expect("live HID").local_held_key_count, 1);
 
-        *hid.write() = test_hid_status(1, 1, 0, true);
-        let status = controller.status().await.expect("observed press status");
-        assert_eq!(status.hid.expect("live HID").observed_held_key_count, 1);
+        apply_live_hid_status(&mut status, Some((4, test_hid_status(0, 1, 5, true))));
+        let hid = status.hid.expect("updated live HID");
+        assert_eq!(hid.local_held_key_count, 0);
+        assert_eq!(hid.observed_held_key_count, 1);
+        assert_eq!(hid.keyboard_leds, 5);
 
-        *hid.write() = test_hid_status(0, 1, 0, true);
-        let status = controller.status().await.expect("local release status");
-        let hid_status = status.hid.expect("live HID");
-        assert_eq!(hid_status.local_held_key_count, 0);
-        assert_eq!(hid_status.observed_held_key_count, 1);
-
-        *hid.write() = test_hid_status(0, 0, 5, true);
-        let status = controller.status().await.expect("observed release status");
-        let hid_status = status.hid.expect("live HID");
-        assert_eq!(hid_status.observed_held_key_count, 0);
-        assert_eq!(hid_status.keyboard_leds, 5);
-
-        *hid.write() = test_hid_status(0, 0, 0, false);
-        let status = controller.status().await.expect("channel close status");
-        let hid_status = status.hid.expect("live HID");
-        assert!(!hid_status.ready);
-        assert_eq!(hid_status.protocol_version, None);
-        assert_eq!(hid_status.keyboard_leds, 0);
+        apply_live_hid_status(&mut status, Some((4, test_hid_status(0, 0, 0, false))));
+        let hid = status.hid.expect("closed live HID");
+        assert!(!hid.ready);
+        assert_eq!(hid.protocol_version, None);
     }
 
-    #[tokio::test]
-    async fn live_hid_is_generation_scoped_and_replaced_on_reconnect() {
-        let old = Arc::new(parking_lot::RwLock::new(test_hid_status(1, 1, 1, true)));
-        let controller = status_controller(
-            connected_test_status(2),
-            Some(live_hid_source(1, Arc::clone(&old))),
-        );
+    #[test]
+    fn live_hid_status_is_connection_generation_scoped() {
+        let mut status = connected_test_status(2);
+        apply_live_hid_status(&mut status, Some((1, test_hid_status(1, 1, 1, true))));
         assert!(
-            controller
-                .status()
-                .await
-                .expect("stale source status")
-                .hid
-                .is_none(),
+            status.hid.is_none(),
             "generation-one HID must not appear in generation two"
         );
 
-        let new = Arc::new(parking_lot::RwLock::new(test_hid_status(0, 0, 2, true)));
-        *controller.live_hid.write() = Some(live_hid_source(2, Arc::clone(&new)));
-        let status = controller.status().await.expect("new generation status");
-        assert_eq!(status.hid.expect("new live HID").keyboard_leds, 2);
+        apply_live_hid_status(&mut status, Some((2, test_hid_status(0, 0, 2, true))));
+        assert_eq!(status.hid.expect("current live HID").keyboard_leds, 2);
 
-        *controller.status.write() = connected_test_status(3);
+        status.connected = false;
+        apply_live_hid_status(&mut status, Some((2, test_hid_status(1, 1, 3, true))));
         assert!(
-            controller
-                .status()
-                .await
-                .expect("next reconnect status")
-                .hid
-                .is_none(),
-            "generation-two HID must not leak into generation three"
+            status.hid.is_none(),
+            "disconnected status must not retain live HID state"
         );
-    }
-
-    #[tokio::test]
-    async fn generation_teardown_clears_live_hid_without_mixed_status() {
-        let hid = Arc::new(parking_lot::RwLock::new(test_hid_status(1, 1, 0, true)));
-        let controller = status_controller(
-            connected_test_status(7),
-            Some(live_hid_source(7, Arc::clone(&hid))),
-        );
-        let mut readers = Vec::new();
-        for _ in 0..8 {
-            let controller = controller.clone();
-            readers.push(tokio::spawn(async move {
-                for _ in 0..100 {
-                    let status = controller.status().await.expect("concurrent status");
-                    if !status.connected {
-                        assert!(status.hid.is_none());
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }));
-        }
-
-        controller.live_hid.write().take();
-        *controller.status.write() = ControllerStatus {
-            connected: false,
-            state: ConnectionState::Reconnecting,
-            generation: 7,
-            device_version: None,
-            signaling: None,
-            device_capabilities: DeviceCapabilities {
-                check_mount_url: None,
-            },
-            frame: None,
-            hid: None,
-            stale_controller_mount: false,
-            last_error: Some("connection ended".to_owned()),
-        };
-        for reader in readers {
-            reader.await.expect("status reader should not panic");
-        }
-        let status = controller.status().await.expect("teardown status");
-        assert_eq!(status.state, ConnectionState::Reconnecting);
-        assert!(status.hid.is_none());
     }
 
     #[tokio::test]
@@ -2299,7 +2307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unexpected_actor_failure_runs_terminal_lifecycle_from_connected_state() {
+    async fn unexpected_actor_error_runs_terminal_lifecycle_from_connected_state() {
         let TerminalActorHarness {
             mut actor,
             status,
@@ -2324,6 +2332,59 @@ mod tests {
             .status()
             .await
             .expect_err("unexpected actor failure is terminal");
+        assert_eq!(
+            crate::error::error_code(&status_error),
+            codes::OPERATION_FAILED
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_task_panic_runs_terminal_lifecycle() {
+        let status = Arc::new(parking_lot::RwLock::new(connected_test_status(9)));
+        let live_hid = Arc::new(parking_lot::RwLock::new(None));
+        let error = Arc::new(parking_lot::Mutex::new(None));
+        let done = CancellationToken::new();
+        let shared = ActorShared {
+            shutdown: CancellationToken::new(),
+            error: Arc::clone(&error),
+            done: done.clone(),
+            status: Arc::clone(&status),
+            live_hid: Arc::clone(&live_hid),
+            cache: LatestFrameCache::new(),
+        };
+        let (event_tx, mut events) = broadcast::channel(1);
+        let actor_task = tokio::spawn(async {
+            panic!(
+                "actor panic at \
+                 https://operator:secret-token@example.invalid/private.iso?token=secret-token"
+            );
+        });
+
+        supervise_actor_task(actor_task, shared, event_tx)
+            .await
+            .expect("actor supervisor should not panic");
+
+        assert!(done.is_cancelled(), "actor panic must signal completion");
+        assert_terminal_state(&status, &live_hid, &error);
+        assert_eq!(
+            error.lock().as_deref(),
+            Some("controller actor panicked"),
+            "panic payload must not reach public lifecycle state"
+        );
+        assert!(matches!(
+            events.recv().await,
+            Ok(ControllerEvent::ConnectionState {
+                state: ConnectionState::ShuttingDown,
+                generation: 9,
+                ..
+            })
+        ));
+
+        let controller = TerminalActorHarness::controller(status, live_hid, error, done);
+        let status_error = controller
+            .status()
+            .await
+            .expect_err("actor panic is terminal");
         assert_eq!(
             crate::error::error_code(&status_error),
             codes::OPERATION_FAILED

@@ -191,6 +191,12 @@ impl MacroTracker {
         let mut lifecycle = self.lifecycle.lock();
         lifecycle.cancel();
         *lifecycle = CancellationToken::new();
+
+        let mut state = self.state.lock();
+        if state.active {
+            state.active = false;
+            self.updates.send_replace(*state);
+        }
     }
 }
 
@@ -828,6 +834,37 @@ mod tests {
         tracker.observe(false);
         let (_, result) = waiter.await.expect("macro waiter should not panic");
         result.expect("matching completion should finish the macro");
+    }
+
+    #[tokio::test]
+    async fn macro_after_active_cancellation_observes_a_fresh_transition() {
+        let tracker = Arc::new(MacroTracker::new());
+        let old_lifecycle = tracker.lifecycle();
+        let (_old_ticket, _old_updates) = tracker.arm(old_lifecycle).expect("old macro should arm");
+        tracker.observe(true);
+
+        tracker.cancel();
+        assert!(!tracker.state.lock().active);
+
+        let lifecycle = tracker.lifecycle();
+        let (ticket, mut updates) = tracker.arm(lifecycle).expect("new macro should arm");
+        let waiter = tokio::spawn(async move {
+            wait_for_macro_completion(&mut updates, ticket, Duration::from_secs(10)).await
+        });
+
+        tracker.observe(false);
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the cancelled macro's completion must not finish the new macro"
+        );
+
+        tracker.observe(true);
+        tracker.observe(false);
+        waiter
+            .await
+            .expect("macro waiter should not panic")
+            .expect("fresh transition should finish the new macro");
     }
 
     #[tokio::test(start_paused = true)]

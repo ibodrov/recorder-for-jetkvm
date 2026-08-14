@@ -37,3 +37,4 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+libc = "0.2"

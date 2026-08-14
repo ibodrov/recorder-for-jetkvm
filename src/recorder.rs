@@ -195,6 +195,22 @@ fn collect_access_unit(pending: &mut Option<AccessUnit>, nal: &NalUnit) -> Optio
     completed
 }
 
+fn buffered_keyframe_start(ring_buffer: &VecDeque<NalUnit>) -> usize {
+    let Some(keyframe_timestamp) = ring_buffer
+        .iter()
+        .rev()
+        .find(|nal| nal.nal_type() == Some(h264::NAL_TYPE_IDR))
+        .map(|nal| nal.rtp_timestamp)
+    else {
+        return 0;
+    };
+
+    ring_buffer
+        .iter()
+        .position(|nal| nal.rtp_timestamp == keyframe_timestamp)
+        .unwrap_or(0)
+}
+
 struct Mp4Writer {
     output_ctx: ffmpeg_the_third::format::context::Output,
     stream_index: usize,
@@ -463,10 +479,7 @@ pub async fn run(
 
                         match Mp4Writer::new(&path, &sps_pps) {
                             Ok(mut w) => {
-                                let keyframe_pos = ring_buffer
-                                    .iter()
-                                    .rposition(|n| n.nal_type() == Some(h264::NAL_TYPE_IDR))
-                                    .unwrap_or(0);
+                                let keyframe_pos = buffered_keyframe_start(&ring_buffer);
 
                                 let mut flushed = 0;
                                 for nal in ring_buffer.iter().skip(keyframe_pos) {
@@ -658,6 +671,41 @@ mod tests {
     }
 
     #[test]
+    fn buffered_keyframe_starts_at_first_nal_in_access_unit() {
+        fn nal(nal_type: u8, rtp_timestamp: u32) -> NalUnit {
+            NalUnit {
+                data: vec![0, 0, 0, 1, nal_type].into(),
+                is_keyframe: nal_type & 0x1f == h264::NAL_TYPE_IDR,
+                timestamp: Instant::now(),
+                rtp_timestamp,
+            }
+        }
+
+        let ring_buffer = VecDeque::from([
+            nal(0x41, 90_000),
+            nal(0x09, 180_000),
+            nal(0x65, 180_000),
+            nal(0x65, 180_000),
+            nal(0x41, 270_000),
+        ]);
+
+        assert_eq!(buffered_keyframe_start(&ring_buffer), 1);
+    }
+
+    #[test]
+    fn buffered_stream_without_idr_keeps_all_nals() {
+        let ring_buffer = VecDeque::from([NalUnit {
+            data: vec![0, 0, 0, 1, 0x41].into(),
+            is_keyframe: false,
+            timestamp: Instant::now(),
+            rtp_timestamp: 90_000,
+        }]);
+
+        assert_eq!(buffered_keyframe_start(&ring_buffer), 0);
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe executables"]
     fn multi_slice_fixture_produces_decodable_mp4_access_units() {
         ffmpeg_the_third::init().expect("initialize FFmpeg");
         let source = include_bytes!("../tests/fixtures/multi_slice.h264");

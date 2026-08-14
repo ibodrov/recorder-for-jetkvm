@@ -257,13 +257,6 @@ impl RpcClient {
     }
 }
 
-impl Drop for RpcClient {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.pending) == 1 {
-            self.cancel_generation();
-        }
-    }
-}
 async fn wait_for_response(
     pending: &PendingMap,
     id: u64,

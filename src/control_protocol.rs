@@ -78,6 +78,7 @@ struct UrlParams {
 struct MountUrlParams {
     url: String,
     mode: VirtualMediaMode,
+    #[serde(default)]
     approved: bool,
 }
 
@@ -85,11 +86,13 @@ struct MountUrlParams {
 struct MountLocalParams {
     path: PathBuf,
     mode: VirtualMediaMode,
+    #[serde(default)]
     approved: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct ApprovalParams {
+    #[serde(default)]
     approved: bool,
 }
 
@@ -97,6 +100,7 @@ struct ApprovalParams {
 struct UploadParams {
     path: PathBuf,
     filename: String,
+    #[serde(default)]
     approved: bool,
 }
 
@@ -105,6 +109,7 @@ struct StorageFileParams {
     filename: String,
     #[serde(default)]
     mode: Option<VirtualMediaMode>,
+    #[serde(default)]
     approved: bool,
 }
 
@@ -182,7 +187,7 @@ struct QueuedRequest {
 
 pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
     let (output_tx, mut output_rx) = mpsc::channel::<Value>(OUTPUT_BUFFER);
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         let stdout = tokio::io::stdout();
         let mut writer = BufWriter::new(stdout);
         while let Some(value) = output_rx.recv().await {
@@ -267,9 +272,16 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
 
     let mut handshake_complete = false;
     let mut shutdown_response: Option<(Value, String)> = None;
+    let mut writer_finished = false;
 
-    loop {
+    let protocol_result: Result<()> = async {
+        loop {
         tokio::select! {
+            writer_result = &mut writer => {
+                writer_finished = true;
+                writer_result.context("protocol writer task failed")??;
+                return Err(anyhow::anyhow!("protocol writer stopped unexpectedly"));
+            },
             _ = server_shutdown.cancelled() => break,
             line = input_rx.recv() => {
                 let Some(line) = line else {
@@ -362,22 +374,16 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                             continue;
                         }
 
-                        if request.method == "hello" {
-                            send_error(
-                                &output_tx,
-                                request.id,
-                                "invalid_params",
-                                "handshake is already complete".to_owned(),
-                            ).await?;
-                            continue;
-                        }
 
                         let key = request_key(&request.id);
                         let upload_cancellation =
                             (request.method == "upload").then(CancellationToken::new);
                         let kind = if let Some(cancellation) = upload_cancellation.clone() {
                             ActiveKind::Upload(cancellation)
-                        } else if matches!(request.method.as_str(), "status" | "cancel" | "shutdown")
+                        } else if matches!(
+                            request.method.as_str(),
+                            "hello" | "status" | "cancel" | "shutdown"
+                        )
                         {
                             ActiveKind::Control
                         } else {
@@ -393,6 +399,18 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                             send_error(&output_tx, response_id, code, message).await?;
                             continue;
                         }
+                        if request.method == "hello" {
+                            send_error(
+                                &output_tx,
+                                request.id,
+                                "invalid_params",
+                                "handshake is already complete".to_owned(),
+                            )
+                            .await?;
+                            active.lock().await.remove(&key);
+                            continue;
+                        }
+
 
                         if request.method == "shutdown" {
                             shutdown_response = Some((request.id, key));
@@ -478,6 +496,9 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
             }
         }
     }
+        Ok(())
+    }
+    .await;
 
     // Stop admission, cancel uploads, and trigger lifecycle cleanup before
     // draining ordered work. Controller shutdown interrupts a blocked device
@@ -497,21 +518,33 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
     };
     let cleanup_result = controller_result.and(drain_result);
 
-    if let Some((id, key)) = shutdown_response {
-        active.lock().await.remove(&key);
-        match &cleanup_result {
-            Ok(()) => send_success(&output_tx, id, Value::Null).await?,
-            Err(error) => {
-                let error = public_error(error);
-                send_error(&output_tx, id, error.code, error.message).await?;
+    let shutdown_response_result: Result<()> = async {
+        if let Some((id, key)) = shutdown_response {
+            active.lock().await.remove(&key);
+            match &cleanup_result {
+                Ok(()) => send_success(&output_tx, id, Value::Null).await?,
+                Err(error) => {
+                    let error = public_error(error);
+                    send_error(&output_tx, id, error.code, error.message).await?;
+                }
             }
         }
+        Ok(())
     }
+    .await;
 
     event_task.abort();
     drop(output_tx);
-    writer.await.context("protocol writer task failed")??;
-    cleanup_result
+    let writer_result = if writer_finished {
+        Ok(())
+    } else {
+        writer.await.context("protocol writer task failed")?
+    };
+
+    protocol_result
+        .and(cleanup_result)
+        .and(shutdown_response_result)
+        .and(writer_result)
 }
 
 /// Waits for Ctrl+C on every platform and SIGTERM on Unix.
@@ -1016,6 +1049,40 @@ mod tests {
         .expect("selected snapshot params");
         assert_eq!(selected.path, Some(PathBuf::from("/tmp/selected.png")));
         assert!(selected.approved);
+    }
+
+    #[test]
+    fn destructive_operation_approval_defaults_to_denied() {
+        let mount_url: MountUrlParams = serde_json::from_value(serde_json::json!({
+            "url": "https://example.invalid/image.iso",
+            "mode": "CDROM",
+        }))
+        .expect("mount URL params");
+        assert!(!mount_url.approved);
+
+        let mount_local: MountLocalParams = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/image.iso",
+            "mode": "Disk",
+        }))
+        .expect("mount local params");
+        assert!(!mount_local.approved);
+
+        let approval: ApprovalParams =
+            serde_json::from_value(serde_json::json!({})).expect("approval params");
+        assert!(!approval.approved);
+
+        let upload: UploadParams = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/image.iso",
+            "filename": "image.iso",
+        }))
+        .expect("upload params");
+        assert!(!upload.approved);
+
+        let storage_file: StorageFileParams = serde_json::from_value(serde_json::json!({
+            "filename": "image.iso",
+        }))
+        .expect("storage file params");
+        assert!(!storage_file.approved);
     }
 
     #[test]

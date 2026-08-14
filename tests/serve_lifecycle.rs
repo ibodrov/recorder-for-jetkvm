@@ -175,24 +175,24 @@ fn response(server: &mut Server, id: u64) -> serde_json::Value {
     }
 }
 
-fn expect_clean_exit(mut server: Server, context: &str) -> String {
-    drop(server.stdin.take());
+fn wait_for_exit(child: &mut Child, context: &str) -> std::process::ExitStatus {
     let started = std::time::Instant::now();
     loop {
-        match server.child.try_wait().expect("wait on child") {
-            Some(status) => {
-                assert!(status.success(), "{context}: process exited with {status}");
-                break;
-            }
-            None => {
-                assert!(
-                    started.elapsed() < DEADLINE,
-                    "{context}: process did not exit within {DEADLINE:?}"
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
+        if let Some(status) = child.try_wait().expect("wait on child") {
+            return status;
         }
+        assert!(
+            started.elapsed() < DEADLINE,
+            "{context}: process did not exit within {DEADLINE:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn expect_clean_exit(mut server: Server, context: &str) -> String {
+    drop(server.stdin.take());
+    let status = wait_for_exit(&mut server.child, context);
+    assert!(status.success(), "{context}: process exited with {status}");
 
     while let Ok(line) = server.stdout.recv_timeout(Duration::from_millis(50)) {
         let line = line.expect("read remaining stdout");
@@ -279,6 +279,72 @@ fn unsupported_protocol_version_is_rejected_cleanly() {
         "v2 hello must succeed after a rejected v1 attempt"
     );
     expect_clean_exit(server, "version rejection");
+}
+
+#[test]
+fn closed_stdout_stops_server_promptly() {
+    let mut child = Command::new(BIN)
+        .args(["serve", "--stdio", "--host", "http://127.0.0.1:1"])
+        .env("JETKVM_PASSWORD", "test-password")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server with closed stdout");
+    let mut stdin = child.stdin.take().expect("stdin pipe");
+    drop(child.stdout.take());
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "id": 1,
+            "method": "hello",
+            "params": { "protocol_version": 2 },
+        })
+    )
+    .expect("write hello");
+    stdin.flush().expect("flush hello");
+
+    let status = wait_for_exit(&mut child, "closed stdout");
+    assert!(
+        !status.success(),
+        "protocol output failure must produce a nonzero exit"
+    );
+}
+
+#[test]
+fn repeated_hello_obeys_duplicate_id_protection() {
+    let endpoint = HangingHttpServer::start();
+    let mut server = spawn_server_at(&endpoint.host);
+    request(&mut server, 2, "connect", serde_json::json!({}));
+    request(
+        &mut server,
+        2,
+        "hello",
+        serde_json::json!({ "protocol_version": 2 }),
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let duplicate = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let line = server
+            .stdout
+            .recv_timeout(remaining)
+            .expect("duplicate response deadline")
+            .expect("read duplicate response");
+        let value: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("stdout line is valid NDJSON");
+        if value.get("event").is_none() {
+            break value;
+        }
+    };
+    assert_eq!(duplicate["id"], serde_json::Value::Null);
+    assert_eq!(duplicate["error"]["code"], "duplicate_request_id");
+
+    request(&mut server, 3, "shutdown", serde_json::json!({}));
+    assert!(response(&mut server, 3).get("result").is_some());
+    expect_clean_exit(server, "repeated hello");
 }
 
 #[test]
@@ -387,15 +453,21 @@ fn stdin_eof_exits_cleanly_while_offline() {
 }
 
 #[cfg(unix)]
+fn send_signal(child: &Child, signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `child.id()` is a live child-process PID and `signal` is one of
+    // the platform signal constants used below.
+    if unsafe { libc::kill(child.id() as libc::pid_t, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn sigterm_exits_cleanly_while_offline() {
     let server = spawn_server();
-    let pid = server.child.id().to_string();
-    let status = Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .expect("run kill");
-    assert!(status.success(), "kill -TERM failed");
+    send_signal(&server.child, libc::SIGTERM).expect("send SIGTERM");
     expect_clean_exit(server, "SIGTERM");
 }
 
@@ -403,12 +475,7 @@ fn sigterm_exits_cleanly_while_offline() {
 #[test]
 fn sigint_exits_cleanly_while_offline() {
     let server = spawn_server();
-    let pid = server.child.id().to_string();
-    let status = Command::new("kill")
-        .args(["-INT", &pid])
-        .status()
-        .expect("run kill");
-    assert!(status.success(), "kill -INT failed");
+    send_signal(&server.child, libc::SIGINT).expect("send SIGINT");
     expect_clean_exit(server, "SIGINT");
 }
 
@@ -416,9 +483,8 @@ fn sigint_exits_cleanly_while_offline() {
 #[test]
 fn repeated_signals_remain_idempotent() {
     let server = spawn_server();
-    let pid = server.child.id().to_string();
     for _ in 0..2 {
-        let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        let _ = send_signal(&server.child, libc::SIGTERM);
         std::thread::sleep(Duration::from_millis(100));
     }
     expect_clean_exit(server, "repeated SIGTERM");

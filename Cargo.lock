@@ -2089,6 +2089,7 @@ dependencies = [
  "directories",
  "ffmpeg-the-third",
  "futures-util",
+ "libc",
  "native-tls",
  "parking_lot",
  "rand 0.9.5",
