@@ -68,6 +68,12 @@ status — no separate `status` round trip is needed. Device-dependent support
 is reported separately in `status.device_capabilities`: `check_mount_url` is
 `null` while disconnected or unknown, then `true` or `false` for the active
 connection generation. No events are emitted before the handshake response.
+While connected, `status.hid` is read live from the active generation's HID
+client, so device-observed held keys, modifier state, keyboard LEDs, channel
+readiness, local key intent, and mouse buttons do not wait for another
+controller command. Frame and HID fields are omitted unless their generation
+matches the reported connection; teardown clears both generation-scoped
+sources.
 
 ```json
 {"id":1,"method":"hello","params":{"protocol_version":2}}
@@ -86,6 +92,12 @@ with `duplicate_request_id` and a `null` response ID so the original request
 retains exactly one correlated terminal response. An ID may be reused after
 that response.
 
+Ordinary admission is limited to 64 active requests. Those slots do not
+include the bounded control plane: `status`, `cancel`, and `shutdown` remain
+reachable when all ordinary slots are active. Control requests still
+participate in duplicate-ID checking. They execute inline in the single
+protocol reader, so reserved control admission does not create an unbounded
+queue.
 
 ### Ordering and cancellation
 
@@ -139,6 +151,13 @@ work, reset HID, and unmount and verify controller-owned media **before** the
 local range server stops. Signaling, data channels, and the peer connection
 then close. A protocol shutdown response is emitted only after cleanup; the
 process exits successfully only when cleanup succeeds.
+
+If the controller actor terminates unexpectedly, it first publishes a
+disconnected `shutting_down` snapshot with frame, HID, and device fields
+cleared. Once termination completes, `status` and subsequent commands return
+the stable typed `operation_failed` error rather than presenting the terminal
+snapshot as a recoverable connection state. Terminal messages are sanitized
+before entering shared state or protocol output.
 
 Run `recorder-for-jetkvm --help` or
 `recorder-for-jetkvm serve --help` for all options.

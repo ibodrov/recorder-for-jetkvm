@@ -1088,6 +1088,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_tracks_local_and_device_observed_changes_without_another_action() {
+        let (reliable, remote, offer_peer, answer_peer) = connected_hid_channel_pair().await;
+        let client = HidClient::new(
+            Arc::clone(&reliable),
+            Arc::clone(&reliable),
+            Arc::clone(&reliable),
+        );
+        remote
+            .send(&Bytes::from_static(&[TYPE_HANDSHAKE, PROTOCOL_VERSION]))
+            .await
+            .expect("remote handshake should send");
+        client
+            .wait_ready(Duration::from_secs(2))
+            .await
+            .expect("client should become ready");
+
+        client
+            .key(KeyEvent {
+                usage: 0x68,
+                pressed: true,
+            })
+            .await
+            .expect("F13 press should send");
+        assert_eq!(client.status().local_held_key_count, 1);
+        assert_eq!(client.status().observed_held_key_count, 0);
+
+        remote
+            .send(&Bytes::from_static(&[
+                TYPE_KEYS_DOWN_STATE,
+                0,
+                0x68,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]))
+            .await
+            .expect("observed press should send");
+        wait_for_hid_status(&client, |status| status.observed_held_key_count == 1).await;
+
+        remote
+            .send(&Bytes::from_static(&[TYPE_KEYBOARD_LED_STATE, 0x05]))
+            .await
+            .expect("LED update should send");
+        wait_for_hid_status(&client, |status| status.keyboard_leds == 0x05).await;
+
+        client
+            .key(KeyEvent {
+                usage: 0x68,
+                pressed: false,
+            })
+            .await
+            .expect("F13 release should send");
+        assert_eq!(client.status().local_held_key_count, 0);
+        assert_eq!(client.status().observed_held_key_count, 1);
+
+        remote
+            .send(&Bytes::from_static(&[
+                TYPE_KEYS_DOWN_STATE,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]))
+            .await
+            .expect("observed release should send");
+        wait_for_hid_status(&client, |status| status.observed_held_key_count == 0).await;
+
+        remote
+            .close()
+            .await
+            .expect("remote HID channel should close");
+        wait_for_hid_status(&client, |status| !status.ready).await;
+        let status = client.status();
+        assert_eq!(status.protocol_version, None);
+        assert_eq!(status.keyboard_leds, 0);
+        assert_eq!(status.local_held_key_count, 0);
+        assert_eq!(status.observed_held_key_count, 0);
+        assert_eq!(status.mouse_buttons, 0);
+
+        offer_peer.close().await.expect("offer peer should close");
+        answer_peer.close().await.expect("answer peer should close");
+    }
+
+    async fn wait_for_hid_status(client: &HidClient, predicate: impl Fn(HidStatus) -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if predicate(client.status()) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HID status should update within deadline");
+    }
+
+    #[tokio::test]
     async fn reset_and_connection_loss_cancel_macro_waiters() {
         let (reliable, remote, offer_peer, answer_peer) = connected_hid_channel_pair().await;
         let client = HidClient::new(

@@ -974,7 +974,7 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use serde_json::{Value, json};
     use webrtc::api::APIBuilder;
@@ -998,6 +998,9 @@ mod tests {
         files: tokio::sync::Mutex<Vec<StorageFile>>,
         start_calls: AtomicUsize,
         delete_calls: AtomicUsize,
+        block_completion: AtomicBool,
+        completion_blocked: Notify,
+        completion_release: Notify,
     }
 
     impl MockStorage {
@@ -1012,6 +1015,9 @@ mod tests {
                 files: tokio::sync::Mutex::new(Vec::new()),
                 start_calls: AtomicUsize::new(0),
                 delete_calls: AtomicUsize::new(0),
+                block_completion: AtomicBool::new(false),
+                completion_blocked: Notify::new(),
+                completion_release: Notify::new(),
             })
         }
 
@@ -1083,6 +1089,13 @@ mod tests {
                         transfer.bytes.len() == expected
                     };
                     if complete {
+                        if storage.block_completion.load(Ordering::Acquire) {
+                            storage.completion_blocked.notify_one();
+                            storage.completion_release.notified().await;
+                            if channel.ready_state() == RTCDataChannelState::Closed {
+                                return;
+                            }
+                        }
                         let mut files = storage.files.lock().await;
                         if !files.iter().any(|file| file.filename == storage.filename) {
                             files.push(StorageFile {
@@ -1103,6 +1116,15 @@ mod tests {
 
         async fn transfers(&self) -> Vec<ObservedTransfer> {
             self.transfers.lock().await.clone()
+        }
+
+        fn block_upload_completion(&self) {
+            self.block_completion.store(true, Ordering::Release);
+        }
+
+        fn release_upload_completion(&self) {
+            self.block_completion.store(false, Ordering::Release);
+            self.completion_release.notify_one();
         }
     }
 
@@ -1667,11 +1689,74 @@ mod tests {
             )
             .await
             .expect_err("pre-cancelled upload must fail");
-
         assert_eq!(crate::error::error_code(&error), codes::CANCELLED);
         assert_eq!(harness.storage.start_calls.load(Ordering::SeqCst), 0);
         assert!(harness.storage.transfers().await.is_empty());
         harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn blocked_upload_cancellation_retains_resumable_partial() {
+        let filename = "blocked-cancel.iso";
+        let (file, bytes) = upload_fixture(256 * 1024);
+        let harness =
+            upload_harness(bytes.len() as u64, filename, bytes.len() as u64, &[0, 0]).await;
+        harness.storage.block_upload_completion();
+        let UploadHarness {
+            mut manager,
+            storage,
+            answer_peer,
+        } = harness;
+        let cancellation = CancellationToken::new();
+        let upload_cancellation = cancellation.clone();
+        let path = file.path().to_owned();
+        let upload = tokio::spawn(async move {
+            let result = manager
+                .upload(
+                    &path,
+                    filename,
+                    Approval { approved: true },
+                    upload_cancellation,
+                )
+                .await;
+            (manager, result)
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            storage.completion_blocked.notified(),
+        )
+        .await
+        .expect("upload reaches the controllable completion boundary");
+        assert!(
+            !upload.is_finished(),
+            "upload remains active at the boundary"
+        );
+        cancellation.cancel();
+        let (manager, result) = tokio::time::timeout(Duration::from_secs(2), upload)
+            .await
+            .expect("cancelled upload returns promptly")
+            .expect("upload task should not panic");
+        let error = result.expect_err("blocked upload is cancelled");
+        assert_eq!(crate::error::error_code(&error), codes::CANCELLED);
+        assert!(
+            manager.upload_origins.0.contains_key(filename),
+            "origin proof is retained for a later resume"
+        );
+        assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            storage.files.lock().await.is_empty(),
+            "cancelled partial is not reported as a completed file"
+        );
+        let transfers = storage.transfers().await;
+        assert_eq!(transfers.len(), 1);
+        assert!(
+            !transfers[0].bytes.is_empty(),
+            "transfer began before cancel"
+        );
+
+        storage.release_upload_completion();
+        answer_peer.close().await.expect("close mock peer");
     }
 
     #[tokio::test]

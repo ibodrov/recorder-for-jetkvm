@@ -126,16 +126,24 @@ enum ReadLine {
     Eof,
 }
 
-/// What the protocol layer needs to know about an admitted request: whether
-/// it is an upload (truthful cancellation target) or any other operation
-/// (not cancellable once admitted).
+/// What the protocol layer needs to know about an admitted request. Control
+/// requests retain duplicate-ID protection but do not consume ordinary
+/// capacity; the reader executes them inline, bounding them to one entry.
 #[derive(Clone)]
 enum ActiveKind {
     Upload(CancellationToken),
-    Other,
+    Ordinary,
+    Control,
+}
+
+impl ActiveKind {
+    fn consumes_ordinary_capacity(&self) -> bool {
+        matches!(self, Self::Upload(_) | Self::Ordinary)
+    }
 }
 
 type ActiveMap = Arc<Mutex<HashMap<String, ActiveKind>>>;
+
 async fn admit_request(
     active: &ActiveMap,
     key: String,
@@ -147,10 +155,16 @@ async fn admit_request(
             "duplicate_request_id",
             "request id is already active".to_owned(),
         ))
-    } else if active.len() >= MAX_ACTIVE_REQUESTS {
+    } else if kind.consumes_ordinary_capacity()
+        && active
+            .values()
+            .filter(|active| active.consumes_ordinary_capacity())
+            .count()
+            >= MAX_ACTIVE_REQUESTS
+    {
         Some((
             codes::SERVER_BUSY,
-            format!("at most {MAX_ACTIVE_REQUESTS} requests may be active"),
+            format!("at most {MAX_ACTIVE_REQUESTS} ordinary requests may be active"),
         ))
     } else {
         active.insert(key, kind);
@@ -361,14 +375,15 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                         let key = request_key(&request.id);
                         let upload_cancellation =
                             (request.method == "upload").then(CancellationToken::new);
-                        let admission_error = admit_request(
-                            &active,
-                            key.clone(),
-                            upload_cancellation
-                                .clone()
-                                .map_or(ActiveKind::Other, ActiveKind::Upload),
-                        )
-                        .await;
+                        let kind = if let Some(cancellation) = upload_cancellation.clone() {
+                            ActiveKind::Upload(cancellation)
+                        } else if matches!(request.method.as_str(), "status" | "cancel" | "shutdown")
+                        {
+                            ActiveKind::Control
+                        } else {
+                            ActiveKind::Ordinary
+                        };
+                        let admission_error = admit_request(&active, key.clone(), kind).await;
                         if let Some((code, message)) = admission_error {
                             let response_id = if code == "duplicate_request_id" {
                                 Value::Null
@@ -467,14 +482,7 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
     // Stop admission, cancel uploads, and trigger lifecycle cleanup before
     // draining ordered work. Controller shutdown interrupts a blocked device
     // operation, allowing the dispatcher to complete promptly.
-    {
-        let active = active.lock().await;
-        for kind in active.values() {
-            if let ActiveKind::Upload(token) = kind {
-                token.cancel();
-            }
-        }
-    }
+    cancel_uploads(&active).await;
     drop(dispatch_tx);
     let controller_result = controller.shutdown().await;
     let mut dispatcher = dispatcher;
@@ -566,10 +574,19 @@ async fn cancel_active(active: &ActiveMap, key: &str) -> CancelOutcome {
     let active = active.lock().await;
     match active.get(key) {
         None => CancelOutcome::NoActiveRequest,
-        Some(ActiveKind::Other) => CancelOutcome::NotCancellable,
+        Some(ActiveKind::Ordinary | ActiveKind::Control) => CancelOutcome::NotCancellable,
         Some(ActiveKind::Upload(token)) => {
             token.cancel();
             CancelOutcome::Cancelled
+        }
+    }
+}
+
+async fn cancel_uploads(active: &ActiveMap) {
+    let active = active.lock().await;
+    for kind in active.values() {
+        if let ActiveKind::Upload(token) = kind {
+            token.cancel();
         }
     }
 }
@@ -871,6 +888,7 @@ fn read_ndjson_line<R: BufRead>(reader: &mut R, maximum: usize) -> std::io::Resu
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn framing_recovers_after_oversized_line() {
@@ -994,7 +1012,7 @@ mod tests {
         active
             .lock()
             .await
-            .insert("\"plain\"".to_owned(), ActiveKind::Other);
+            .insert("\"plain\"".to_owned(), ActiveKind::Ordinary);
         assert!(matches!(
             cancel_active(&active, "\"plain\"").await,
             CancelOutcome::NotCancellable
@@ -1027,7 +1045,7 @@ mod tests {
                 .is_none()
         );
 
-        let duplicate = admit_request(&active, key.clone(), ActiveKind::Other)
+        let duplicate = admit_request(&active, key.clone(), ActiveKind::Ordinary)
             .await
             .expect("duplicate is rejected");
         assert_eq!(duplicate.0, "duplicate_request_id");
@@ -1039,11 +1057,322 @@ mod tests {
 
         active.lock().await.remove(&key);
         assert!(
-            admit_request(&active, key, ActiveKind::Other)
+            admit_request(&active, key, ActiveKind::Ordinary)
                 .await
                 .is_none(),
             "an ID is reusable after its terminal response"
         );
+    }
+
+    #[tokio::test]
+    async fn control_admission_survives_saturated_ordinary_capacity() {
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        for id in 0..MAX_ACTIVE_REQUESTS {
+            assert!(
+                admit_request(&active, id.to_string(), ActiveKind::Ordinary)
+                    .await
+                    .is_none()
+            );
+        }
+
+        let status_key = "status".to_owned();
+        assert!(
+            admit_request(&active, status_key.clone(), ActiveKind::Control)
+                .await
+                .is_none(),
+            "control request must not consume ordinary capacity"
+        );
+        let duplicate = admit_request(&active, status_key, ActiveKind::Control)
+            .await
+            .expect("duplicate control ID is rejected");
+        assert_eq!(duplicate.0, "duplicate_request_id");
+
+        let busy = admit_request(&active, "ordinary-65".to_owned(), ActiveKind::Ordinary)
+            .await
+            .expect("sixty-fifth ordinary request is rejected");
+        assert_eq!(busy.0, codes::SERVER_BUSY);
+    }
+
+    #[tokio::test]
+    async fn cancel_reaches_upload_at_saturated_ordinary_capacity() {
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        for id in 0..(MAX_ACTIVE_REQUESTS - 1) {
+            assert!(
+                admit_request(&active, id.to_string(), ActiveKind::Ordinary)
+                    .await
+                    .is_none()
+            );
+        }
+        let upload = CancellationToken::new();
+        assert!(
+            admit_request(
+                &active,
+                "upload".to_owned(),
+                ActiveKind::Upload(upload.clone()),
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            admit_request(&active, "cancel".to_owned(), ActiveKind::Control)
+                .await
+                .is_none()
+        );
+
+        assert!(matches!(
+            cancel_active(&active, "upload").await,
+            CancelOutcome::Cancelled
+        ));
+        assert!(upload.is_cancelled());
+        assert!(
+            active.lock().await.contains_key("upload"),
+            "upload ID remains active until its terminal response"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_upload_allows_status_then_cancel_with_terminal_response() {
+        let (output_tx, mut output_rx) = mpsc::channel(4);
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let (dispatch_tx, dispatch_rx) = mpsc::channel(1);
+        let upload_id = Value::String("upload".to_owned());
+        let upload_key = request_key(&upload_id);
+        let cancellation = CancellationToken::new();
+        assert!(
+            admit_request(
+                &active,
+                upload_key.clone(),
+                ActiveKind::Upload(cancellation.clone()),
+            )
+            .await
+            .is_none()
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler_started = Arc::clone(&started);
+        let dispatcher_active = Arc::clone(&active);
+        let dispatcher = tokio::spawn(async move {
+            run_dispatcher(
+                dispatch_rx,
+                output_tx,
+                dispatcher_active,
+                move |_method, _params, cancellation| {
+                    let started = Arc::clone(&handler_started);
+                    async move {
+                        let cancellation = cancellation.expect("upload cancellation token");
+                        started.notify_one();
+                        cancellation.cancelled().await;
+                        Err::<Value, _>(anyhow::Error::new(CodedError::new(
+                            codes::CANCELLED,
+                            "upload cancelled",
+                        )))
+                    }
+                },
+            )
+            .await;
+        });
+        dispatch_tx
+            .send(QueuedRequest {
+                id: upload_id,
+                method: "upload".to_owned(),
+                params: Value::Null,
+                upload_cancellation: Some(cancellation),
+            })
+            .await
+            .expect("admit blocked upload to dispatcher");
+        started.notified().await;
+
+        let status_started = std::time::Instant::now();
+        assert!(
+            admit_request(&active, "status".to_owned(), ActiveKind::Control)
+                .await
+                .is_none()
+        );
+        assert!(status_started.elapsed() < std::time::Duration::from_millis(250));
+        active.lock().await.remove("status");
+
+        assert!(
+            admit_request(&active, "cancel".to_owned(), ActiveKind::Control)
+                .await
+                .is_none()
+        );
+        assert!(matches!(
+            cancel_active(&active, &upload_key).await,
+            CancelOutcome::Cancelled
+        ));
+        assert!(
+            active.lock().await.contains_key(&upload_key),
+            "upload ID remains active until its terminal error is sent"
+        );
+        active.lock().await.remove("cancel");
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), output_rx.recv())
+            .await
+            .expect("cancelled upload terminal deadline")
+            .expect("cancelled upload response");
+        assert_eq!(response["error"]["code"], codes::CANCELLED);
+        drop(dispatch_tx);
+        dispatcher.await.expect("dispatcher joins");
+        assert!(!active.lock().await.contains_key(&upload_key));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_active_and_queued_uploads_before_dispatch_drain() {
+        let (output_tx, mut output_rx) = mpsc::channel(4);
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let (dispatch_tx, dispatch_rx) = mpsc::channel(2);
+        let first_token = CancellationToken::new();
+        let second_token = CancellationToken::new();
+        for (id, token) in [(1, first_token.clone()), (2, second_token.clone())] {
+            let value = Value::from(id);
+            assert!(
+                admit_request(
+                    &active,
+                    request_key(&value),
+                    ActiveKind::Upload(token.clone()),
+                )
+                .await
+                .is_none()
+            );
+            dispatch_tx
+                .send(QueuedRequest {
+                    id: value,
+                    method: "upload".to_owned(),
+                    params: Value::Null,
+                    upload_cancellation: Some(token),
+                })
+                .await
+                .expect("queue upload");
+        }
+
+        let remote_starts = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let handler_starts = Arc::clone(&remote_starts);
+        let handler_first_started = Arc::clone(&first_started);
+        let dispatcher_active = Arc::clone(&active);
+        let dispatcher = tokio::spawn(async move {
+            run_dispatcher(
+                dispatch_rx,
+                output_tx,
+                dispatcher_active,
+                move |_method, _params, cancellation| {
+                    let remote_starts = Arc::clone(&handler_starts);
+                    let first_started = Arc::clone(&handler_first_started);
+                    async move {
+                        let cancellation = cancellation.expect("upload cancellation token");
+                        if !cancellation.is_cancelled() {
+                            remote_starts.fetch_add(1, Ordering::SeqCst);
+                            first_started.notify_one();
+                        }
+                        cancellation.cancelled().await;
+                        Err::<Value, _>(anyhow::Error::new(CodedError::new(
+                            codes::CANCELLED,
+                            "upload cancelled by shutdown",
+                        )))
+                    }
+                },
+            )
+            .await;
+        });
+        first_started.notified().await;
+
+        cancel_uploads(&active).await;
+        assert!(first_token.is_cancelled());
+        assert!(second_token.is_cancelled());
+        drop(dispatch_tx);
+        let first = output_rx.recv().await.expect("first terminal response");
+        let second = output_rx.recv().await.expect("second terminal response");
+        dispatcher.await.expect("dispatcher joins after shutdown");
+        assert_eq!(first["error"]["code"], codes::CANCELLED);
+        assert_eq!(second["error"]["code"], codes::CANCELLED);
+        assert_eq!(
+            remote_starts.load(Ordering::SeqCst),
+            1,
+            "queued upload observes pre-cancellation and never starts remotely"
+        );
+        assert!(active.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_racing_shutdown_is_idempotent_and_retains_active_id() {
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let token = CancellationToken::new();
+        active
+            .lock()
+            .await
+            .insert("upload".to_owned(), ActiveKind::Upload(token.clone()));
+        let (cancel, ()) = tokio::join!(cancel_active(&active, "upload"), cancel_uploads(&active),);
+        assert!(matches!(cancel, CancelOutcome::Cancelled));
+        assert!(token.is_cancelled());
+        assert!(active.lock().await.contains_key("upload"));
+    }
+
+    #[tokio::test]
+    async fn eof_and_sigterm_racing_shutdown_cancel_uploads_idempotently() {
+        for termination in ["eof", "sigterm"] {
+            let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+            let token = CancellationToken::new();
+            active
+                .lock()
+                .await
+                .insert(termination.to_owned(), ActiveKind::Upload(token.clone()));
+
+            tokio::join!(cancel_uploads(&active), cancel_uploads(&active));
+            assert!(token.is_cancelled(), "{termination} race cancels upload");
+            assert!(
+                active.lock().await.contains_key(termination),
+                "{termination} race retains ID until the terminal response"
+            );
+            active.lock().await.remove(termination);
+            assert!(active.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_completion_races_have_deterministic_terminal_outcomes() {
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let completed_before_cancel = CancellationToken::new();
+        active.lock().await.insert(
+            "complete-first".to_owned(),
+            ActiveKind::Upload(completed_before_cancel.clone()),
+        );
+        active.lock().await.remove("complete-first");
+        assert!(matches!(
+            cancel_active(&active, "complete-first").await,
+            CancelOutcome::NoActiveRequest
+        ));
+        assert!(!completed_before_cancel.is_cancelled());
+
+        let cancelled_before_complete = CancellationToken::new();
+        active.lock().await.insert(
+            "cancel-first".to_owned(),
+            ActiveKind::Upload(cancelled_before_complete.clone()),
+        );
+        assert!(matches!(
+            cancel_active(&active, "cancel-first").await,
+            CancelOutcome::Cancelled
+        ));
+        active.lock().await.remove("cancel-first");
+        assert!(cancelled_before_complete.is_cancelled());
+
+        let completed_before_shutdown = CancellationToken::new();
+        active.lock().await.insert(
+            "shutdown-complete-first".to_owned(),
+            ActiveKind::Upload(completed_before_shutdown.clone()),
+        );
+        active.lock().await.remove("shutdown-complete-first");
+        cancel_uploads(&active).await;
+        assert!(!completed_before_shutdown.is_cancelled());
+
+        let shutdown_before_complete = CancellationToken::new();
+        active.lock().await.insert(
+            "shutdown-first".to_owned(),
+            ActiveKind::Upload(shutdown_before_complete.clone()),
+        );
+        cancel_uploads(&active).await;
+        active.lock().await.remove("shutdown-first");
+        assert!(shutdown_before_complete.is_cancelled());
+        assert!(active.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -1085,7 +1414,7 @@ mod tests {
             active
                 .lock()
                 .await
-                .insert(request_key(&id), ActiveKind::Other);
+                .insert(request_key(&id), ActiveKind::Ordinary);
             dispatch_tx
                 .send(QueuedRequest {
                     id,

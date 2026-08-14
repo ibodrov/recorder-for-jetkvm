@@ -184,7 +184,27 @@ pub struct JetKvmController {
     nal_tx: broadcast::Sender<NalUnit>,
     lifecycle: Arc<ControllerLifecycle>,
     status: Arc<parking_lot::RwLock<ControllerStatus>>,
+    live_hid: Arc<parking_lot::RwLock<Option<LiveHidStatus>>>,
     cache: LatestFrameCache,
+}
+
+#[derive(Clone)]
+struct LiveHidStatus {
+    generation: u64,
+    read: Arc<dyn Fn() -> HidStatus + Send + Sync>,
+}
+
+impl LiveHidStatus {
+    fn new(generation: u64, client: crate::hid::HidClient) -> Self {
+        Self {
+            generation,
+            read: Arc::new(move || client.status()),
+        }
+    }
+
+    fn status(&self) -> HidStatus {
+        (self.read)()
+    }
 }
 
 struct ControllerLifecycle {
@@ -355,6 +375,7 @@ struct Actor {
     shutdown: CancellationToken,
     error: Arc<parking_lot::Mutex<Option<String>>>,
     status: Arc<parking_lot::RwLock<ControllerStatus>>,
+    live_hid: Arc<parking_lot::RwLock<Option<LiveHidStatus>>>,
     snapshot_directory: tempfile::TempDir,
     cache: LatestFrameCache,
     media: Option<VirtualMediaManager>,
@@ -377,15 +398,20 @@ struct ActorChannels {
     media_event_tx: broadcast::Sender<MediaEvent>,
 }
 
+struct ActorShared {
+    shutdown: CancellationToken,
+    error: Arc<parking_lot::Mutex<Option<String>>>,
+    status: Arc<parking_lot::RwLock<ControllerStatus>>,
+    live_hid: Arc<parking_lot::RwLock<Option<LiveHidStatus>>>,
+    cache: LatestFrameCache,
+}
+
 impl Actor {
     fn new(
         config: ConnectionConfig,
         connector: Arc<dyn Connector>,
         channels: ActorChannels,
-        shutdown: CancellationToken,
-        error: Arc<parking_lot::Mutex<Option<String>>>,
-        status: Arc<parking_lot::RwLock<ControllerStatus>>,
-        cache: LatestFrameCache,
+        shared: ActorShared,
     ) -> Result<Self> {
         let snapshot_directory = tempfile::Builder::new()
             .prefix("recorder-for-jetkvm-")
@@ -397,6 +423,13 @@ impl Actor {
             nal_tx,
             media_event_tx,
         } = channels;
+        let ActorShared {
+            shutdown,
+            error,
+            status,
+            live_hid,
+            cache,
+        } = shared;
         let parameter_rx = nal_tx.subscribe();
         Ok(Self {
             backoff: config.reconnect_min,
@@ -409,6 +442,7 @@ impl Actor {
             shutdown,
             error,
             status,
+            live_hid,
             snapshot_directory,
             cache,
             media: None,
@@ -421,7 +455,6 @@ impl Actor {
     }
 
     async fn run(mut self) {
-        let actor_error = Arc::clone(&self.error);
         let mut phase = self.start_attempt(Vec::new());
         let result = loop {
             phase = match phase {
@@ -436,12 +469,31 @@ impl Actor {
             };
         };
         if let Err(error) = result {
-            *actor_error.lock() = Some(format!("{error:#}"));
+            self.publish_terminal_failure(&error);
         }
+    }
+
+    fn publish_terminal_failure(&mut self, error: &anyhow::Error) {
+        let message = sanitize_error(error, &self.config.password);
+        self.last_error = Some(message.clone());
+        self.clear_live_hid();
+        self.cache.clear();
+        self.publish_status(self.offline_status(ConnectionState::ShuttingDown));
+        *self.error.lock() = Some(message);
     }
 
     fn publish_status(&self, status: ControllerStatus) {
         *self.status.write() = status;
+    }
+
+    fn clear_live_hid(&self) {
+        let mut live_hid = self.live_hid.write();
+        if live_hid
+            .as_ref()
+            .is_some_and(|live| live.generation == self.generation)
+        {
+            *live_hid = None;
+        }
     }
 
     fn transition_event(&self, state: ConnectionState) {
@@ -458,6 +510,7 @@ impl Actor {
     /// Starts a connection attempt immediately, incrementing the generation
     /// at this single defined boundary.
     fn start_attempt(&mut self, waiters: Vec<oneshot::Sender<Result<ControllerStatus>>>) -> Phase {
+        self.clear_live_hid();
         self.generation = self.generation.saturating_add(1);
         // Fresh subscription before the attempt so the new session's initial
         // parameter-set burst is observed and nothing stale can be buffered.
@@ -604,17 +657,11 @@ impl Actor {
                             let _ = response.send(Ok(self.connected_status(&connected)));
                         }
                         Command::Disconnect(response) => {
+                            self.publish_status(
+                                self.offline_status(ConnectionState::Disconnected),
+                            );
                             let result = self.teardown_full(connected).await;
-                            let failed = result.is_err();
-                            let _ = response.send(result);
-                            if failed {
-                                return Phase::Shutdown(Err(anyhow!(
-                                    "failed to clean up the disconnected session"
-                                )));
-                            }
-                            self.last_error = None;
-                            self.transition_event(ConnectionState::Disconnected);
-                            return Phase::Disconnected;
+                            return self.finish_disconnect(response, result);
                         }
                         command => {
                             match self.execute_connected(&mut connected, &mut end_watch, command).await {
@@ -938,6 +985,7 @@ impl Actor {
             }
         }
         let _ = self.media().refresh_state().await;
+        *self.live_hid.write() = Some(LiveHidStatus::new(self.generation, session.hid().clone()));
         let keepalive = session.hid().start_keepalive(session.cancellation());
         let connected = Connected {
             notifications: session.rpc().subscribe_notifications(),
@@ -970,6 +1018,11 @@ impl Actor {
             }
         }
         let taken_over = connected.taken_over;
+        self.publish_status(self.offline_status(if taken_over {
+            ConnectionState::TakenOver
+        } else {
+            ConnectionState::Reconnecting
+        }));
         self.teardown_light(connected).await;
         if taken_over {
             warn!(
@@ -991,6 +1044,7 @@ impl Actor {
             generation = self.generation,
             "JetKVM controller session was taken over"
         );
+        self.publish_status(self.offline_status(ConnectionState::TakenOver));
         self.teardown_light(connected).await;
         self.transition_event(ConnectionState::TakenOver);
         Phase::TakenOver
@@ -1000,6 +1054,7 @@ impl Actor {
     /// intent is cleared, per-generation tasks stop. The media manager (and
     /// any controller-hosted range server) survives for a later rebind.
     async fn teardown_light(&mut self, connected: Box<Connected>) {
+        self.clear_live_hid();
         let Connected {
             session,
             keepalive,
@@ -1020,6 +1075,7 @@ impl Actor {
     /// cleanup (unmount + verify) runs before the session and any range
     /// server go away.
     async fn teardown_full(&mut self, connected: Box<Connected>) -> Result<()> {
+        self.clear_live_hid();
         let Connected {
             session,
             keepalive,
@@ -1047,7 +1103,28 @@ impl Actor {
         media_result.and(session_result)
     }
 
+    fn finish_disconnect(
+        &mut self,
+        response: oneshot::Sender<Result<()>>,
+        result: Result<()>,
+    ) -> Phase {
+        match result {
+            Ok(()) => {
+                let _ = response.send(Ok(()));
+                self.last_error = None;
+                self.transition_event(ConnectionState::Disconnected);
+                Phase::Disconnected
+            }
+            Err(error) => {
+                let message = sanitize_error(&error, &self.config.password);
+                let _ = response.send(Err(operation_failed(message.clone())));
+                Phase::Shutdown(Err(operation_failed(message)))
+            }
+        }
+    }
+
     async fn shutdown_cleanup(&mut self, connected: Option<Box<Connected>>) -> Phase {
+        self.clear_live_hid();
         self.transition_event(ConnectionState::ShuttingDown);
         let result = match connected {
             Some(connected) => self.teardown_full(connected).await,
@@ -1059,6 +1136,10 @@ impl Actor {
                 None => Ok(()),
             },
         };
+        self.finish_shutdown(result)
+    }
+
+    fn finish_shutdown(&self, result: Result<()>) -> Phase {
         Phase::Shutdown(result)
     }
 
@@ -1283,6 +1364,7 @@ impl JetKvmController {
             stale_controller_mount: false,
             last_error: None,
         }));
+        let live_hid = Arc::new(parking_lot::RwLock::new(None));
         let cache = LatestFrameCache::new();
         let lifecycle = Arc::new(ControllerLifecycle {
             shutdown: shutdown.clone(),
@@ -1318,6 +1400,7 @@ impl JetKvmController {
         let spawn_event_tx = event_tx.clone();
         let spawn_nal_tx = nal_tx.clone();
         let actor_status = Arc::clone(&status);
+        let actor_live_hid = Arc::clone(&live_hid);
         let actor_cache = cache.clone();
         tokio::spawn(async move {
             match Actor::new(
@@ -1329,10 +1412,13 @@ impl JetKvmController {
                     nal_tx: spawn_nal_tx,
                     media_event_tx,
                 },
-                shutdown,
-                error,
-                actor_status,
-                actor_cache,
+                ActorShared {
+                    shutdown,
+                    error,
+                    status: actor_status,
+                    live_hid: actor_live_hid,
+                    cache: actor_cache,
+                },
             ) {
                 Ok(actor) => {
                     let _ = ready_tx.send(Ok(()));
@@ -1354,6 +1440,7 @@ impl JetKvmController {
             nal_tx,
             lifecycle,
             status,
+            live_hid,
             cache,
         })
     }
@@ -1367,34 +1454,48 @@ impl JetKvmController {
     }
 
     pub async fn status(&self) -> Result<ControllerStatus> {
+        if let Some(error) = lifecycle_failure(&self.lifecycle) {
+            return Err(error);
+        }
         let mut status = self.status.read().clone();
         if status.connected {
-            status.frame = self.cache.info().map(|frame| FrameStatus {
-                age_ms: duration_millis(frame.age),
-                width: frame.width,
-                height: frame.height,
-                generation: frame.generation,
-                frame_id: frame.frame_id,
-                captured_at: format_system_time(frame.captured_at),
-            });
+            status.frame = self
+                .cache
+                .info()
+                .filter(|frame| frame.generation == status.generation)
+                .map(|frame| FrameStatus {
+                    age_ms: duration_millis(frame.age),
+                    width: frame.width,
+                    height: frame.height,
+                    generation: frame.generation,
+                    frame_id: frame.frame_id,
+                    captured_at: format_system_time(frame.captured_at),
+                });
+            let hid = self
+                .live_hid
+                .read()
+                .as_ref()
+                .filter(|live| live.generation == status.generation)
+                .cloned();
+            status.hid = hid.map(|live| live.status());
+        } else {
+            status.frame = None;
+            status.hid = None;
         }
         Ok(status)
     }
 
     pub async fn reconnect(&self) -> Result<ControllerStatus> {
-        request(&self.command_tx, Command::Connect).await
+        self.request(Command::Connect).await
     }
 
     pub async fn disconnect(&self) -> Result<()> {
-        request(&self.command_tx, Command::Disconnect).await
+        self.request(Command::Disconnect).await
     }
 
     pub async fn snapshot(&self, after: Option<FrameCursor>) -> Result<Snapshot> {
-        request_with(&self.command_tx, |response| Command::Snapshot {
-            after,
-            response,
-        })
-        .await
+        self.request_with(|response| Command::Snapshot { after, response })
+            .await
     }
 
     pub async fn snapshot_to(
@@ -1403,7 +1504,7 @@ impl JetKvmController {
         approval: Approval,
         after: Option<FrameCursor>,
     ) -> Result<Snapshot> {
-        request_with(&self.command_tx, |response| Command::SnapshotTo {
+        self.request_with(|response| Command::SnapshotTo {
             path,
             approval,
             after,
@@ -1413,43 +1514,36 @@ impl JetKvmController {
     }
 
     pub async fn key(&self, event: KeyEvent) -> Result<ActionReceipt> {
-        request_with(&self.command_tx, |response| Command::Key(event, response)).await
+        self.request_with(|response| Command::Key(event, response))
+            .await
     }
 
     pub async fn type_text(&self, request_value: TypeTextRequest) -> Result<ActionReceipt> {
-        request_with(&self.command_tx, |response| {
-            Command::TypeText(request_value, response)
-        })
-        .await
+        self.request_with(|response| Command::TypeText(request_value, response))
+            .await
     }
 
     pub async fn absolute_mouse(&self, event: AbsoluteMouseEvent) -> Result<ActionReceipt> {
-        request_with(&self.command_tx, |response| {
-            Command::AbsoluteMouse(event, response)
-        })
-        .await
+        self.request_with(|response| Command::AbsoluteMouse(event, response))
+            .await
     }
 
     pub async fn relative_mouse(&self, event: RelativeMouseEvent) -> Result<ActionReceipt> {
-        request_with(&self.command_tx, |response| {
-            Command::RelativeMouse(event, response)
-        })
-        .await
+        self.request_with(|response| Command::RelativeMouse(event, response))
+            .await
     }
 
     pub async fn scroll(&self, event: ScrollEvent) -> Result<ActionReceipt> {
-        request_with(&self.command_tx, |response| {
-            Command::Scroll(event, response)
-        })
-        .await
+        self.request_with(|response| Command::Scroll(event, response))
+            .await
     }
 
     pub async fn media_state(&self) -> Result<Option<VirtualMediaState>> {
-        request(&self.command_tx, Command::MediaState).await
+        self.request(Command::MediaState).await
     }
 
     pub async fn check_mount_url(&self, url: String, approval: Approval) -> Result<MountUrlInfo> {
-        request_with(&self.command_tx, |response| Command::CheckMountUrl {
+        self.request_with(|response| Command::CheckMountUrl {
             url,
             approval,
             response,
@@ -1463,7 +1557,7 @@ impl JetKvmController {
         mode: VirtualMediaMode,
         approval: Approval,
     ) -> Result<VirtualMediaState> {
-        request_with(&self.command_tx, |response| Command::MountUrl {
+        self.request_with(|response| Command::MountUrl {
             url,
             mode,
             approval,
@@ -1478,7 +1572,7 @@ impl JetKvmController {
         mode: VirtualMediaMode,
         approval: Approval,
     ) -> Result<VirtualMediaState> {
-        request_with(&self.command_tx, |response| Command::MountLocal {
+        self.request_with(|response| Command::MountLocal {
             path,
             mode,
             approval,
@@ -1488,18 +1582,16 @@ impl JetKvmController {
     }
 
     pub async fn unmount(&self, approval: Approval) -> Result<()> {
-        request_with(&self.command_tx, |response| {
-            Command::Unmount(approval, response)
-        })
-        .await
+        self.request_with(|response| Command::Unmount(approval, response))
+            .await
     }
 
     pub async fn storage_space(&self) -> Result<StorageSpace> {
-        request(&self.command_tx, Command::StorageSpace).await
+        self.request(Command::StorageSpace).await
     }
 
     pub async fn storage_files(&self) -> Result<Vec<StorageFile>> {
-        request(&self.command_tx, Command::StorageFiles).await
+        self.request(Command::StorageFiles).await
     }
 
     pub async fn upload(
@@ -1509,7 +1601,7 @@ impl JetKvmController {
         approval: Approval,
         cancellation: CancellationToken,
     ) -> Result<StorageFile> {
-        request_with(&self.command_tx, |response| Command::Upload {
+        self.request_with(|response| Command::Upload {
             path,
             filename,
             approval,
@@ -1525,7 +1617,7 @@ impl JetKvmController {
         mode: VirtualMediaMode,
         approval: Approval,
     ) -> Result<VirtualMediaState> {
-        request_with(&self.command_tx, |response| Command::MountStorage {
+        self.request_with(|response| Command::MountStorage {
             filename,
             mode,
             approval,
@@ -1535,7 +1627,7 @@ impl JetKvmController {
     }
 
     pub async fn delete_storage(&self, filename: String, approval: Approval) -> Result<()> {
-        request_with(&self.command_tx, |response| Command::DeleteStorage {
+        self.request_with(|response| Command::DeleteStorage {
             filename,
             approval,
             response,
@@ -1551,32 +1643,52 @@ impl JetKvmController {
         )
         .await
         .context("controller actor did not stop within the shutdown deadline")?;
-        if let Some(error) = self.lifecycle.error.lock().clone() {
-            return Err(anyhow!(error));
+        if let Some(error) = lifecycle_failure(&self.lifecycle) {
+            return Err(error);
         }
         Ok(())
     }
+
+    async fn request<T>(
+        &self,
+        constructor: fn(oneshot::Sender<Result<T>>) -> Command,
+    ) -> Result<T> {
+        self.request_with(constructor).await
+    }
+
+    async fn request_with<T>(
+        &self,
+        constructor: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
+    ) -> Result<T> {
+        if let Some(error) = lifecycle_failure(&self.lifecycle) {
+            return Err(error);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(constructor(response_tx))
+            .await
+            .is_err()
+        {
+            return Err(lifecycle_failure(&self.lifecycle)
+                .unwrap_or_else(|| operation_failed("controller actor stopped")));
+        }
+        response_rx.await.unwrap_or_else(|_| {
+            Err(lifecycle_failure(&self.lifecycle)
+                .unwrap_or_else(|| operation_failed("controller response was dropped")))
+        })
+    }
 }
 
-async fn request<T>(
-    sender: &mpsc::Sender<Command>,
-    constructor: fn(oneshot::Sender<Result<T>>) -> Command,
-) -> Result<T> {
-    request_with(sender, constructor).await
+fn lifecycle_failure(lifecycle: &ControllerLifecycle) -> Option<anyhow::Error> {
+    if !lifecycle.done.is_cancelled() {
+        return None;
+    }
+    lifecycle.error.lock().clone().map(operation_failed)
 }
 
-async fn request_with<T>(
-    sender: &mpsc::Sender<Command>,
-    constructor: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
-) -> Result<T> {
-    let (response_tx, response_rx) = oneshot::channel();
-    sender
-        .send(constructor(response_tx))
-        .await
-        .context("controller actor stopped")?;
-    response_rx
-        .await
-        .context("controller response was dropped")?
+fn operation_failed(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(CodedError::new(codes::OPERATION_FAILED, message))
 }
 
 /// Conservative firmware gate for the `checkMountUrl` RPC. Upstream
@@ -1765,6 +1877,69 @@ mod tests {
         .expect("attempt count reached within deadline");
     }
 
+    fn test_hid_status(local: usize, observed: usize, leds: u8, ready: bool) -> HidStatus {
+        HidStatus {
+            ready,
+            protocol_version: ready.then_some(crate::hid::PROTOCOL_VERSION),
+            keyboard_leds: leds,
+            held_key_count: local,
+            local_held_key_count: local,
+            local_non_modifier_key_count: local,
+            observed_held_key_count: observed,
+            observed_modifier_mask: 0,
+            mouse_buttons: 0,
+        }
+    }
+
+    fn connected_test_status(generation: u64) -> ControllerStatus {
+        ControllerStatus {
+            connected: true,
+            state: ConnectionState::Connected,
+            generation,
+            device_version: Some("0.5.8".to_owned()),
+            signaling: Some("websocket".to_owned()),
+            device_capabilities: DeviceCapabilities {
+                check_mount_url: Some(false),
+            },
+            frame: None,
+            hid: Some(test_hid_status(0, 0, 0, true)),
+            stale_controller_mount: false,
+            last_error: None,
+        }
+    }
+
+    fn live_hid_source(
+        generation: u64,
+        status: Arc<parking_lot::RwLock<HidStatus>>,
+    ) -> LiveHidStatus {
+        LiveHidStatus {
+            generation,
+            read: Arc::new(move || *status.read()),
+        }
+    }
+
+    fn status_controller(
+        status: ControllerStatus,
+        live_hid: Option<LiveHidStatus>,
+    ) -> JetKvmController {
+        let (command_tx, _) = mpsc::channel(1);
+        let (event_tx, _) = broadcast::channel(1);
+        let (nal_tx, _) = broadcast::channel(1);
+        JetKvmController {
+            command_tx,
+            event_tx,
+            nal_tx,
+            lifecycle: Arc::new(ControllerLifecycle {
+                shutdown: CancellationToken::new(),
+                done: CancellationToken::new(),
+                error: Arc::new(parking_lot::Mutex::new(None)),
+            }),
+            status: Arc::new(parking_lot::RwLock::new(status)),
+            live_hid: Arc::new(parking_lot::RwLock::new(live_hid)),
+            cache: LatestFrameCache::new(),
+        }
+    }
+
     #[test]
     fn connection_config_debug_redacts_password() {
         let config = ConnectionConfig {
@@ -1801,6 +1976,241 @@ mod tests {
         assert!(status.frame.is_none());
         assert!(status.hid.is_none());
         assert_eq!(status.last_error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn status_reads_live_hid_changes_instead_of_cached_command_status() {
+        let hid = Arc::new(parking_lot::RwLock::new(test_hid_status(1, 0, 0, true)));
+        let controller = status_controller(
+            connected_test_status(4),
+            Some(live_hid_source(4, Arc::clone(&hid))),
+        );
+
+        let status = controller.status().await.expect("initial status");
+        assert_eq!(status.hid.expect("live HID").local_held_key_count, 1);
+
+        *hid.write() = test_hid_status(1, 1, 0, true);
+        let status = controller.status().await.expect("observed press status");
+        assert_eq!(status.hid.expect("live HID").observed_held_key_count, 1);
+
+        *hid.write() = test_hid_status(0, 1, 0, true);
+        let status = controller.status().await.expect("local release status");
+        let hid_status = status.hid.expect("live HID");
+        assert_eq!(hid_status.local_held_key_count, 0);
+        assert_eq!(hid_status.observed_held_key_count, 1);
+
+        *hid.write() = test_hid_status(0, 0, 5, true);
+        let status = controller.status().await.expect("observed release status");
+        let hid_status = status.hid.expect("live HID");
+        assert_eq!(hid_status.observed_held_key_count, 0);
+        assert_eq!(hid_status.keyboard_leds, 5);
+
+        *hid.write() = test_hid_status(0, 0, 0, false);
+        let status = controller.status().await.expect("channel close status");
+        let hid_status = status.hid.expect("live HID");
+        assert!(!hid_status.ready);
+        assert_eq!(hid_status.protocol_version, None);
+        assert_eq!(hid_status.keyboard_leds, 0);
+    }
+
+    #[tokio::test]
+    async fn live_hid_is_generation_scoped_and_replaced_on_reconnect() {
+        let old = Arc::new(parking_lot::RwLock::new(test_hid_status(1, 1, 1, true)));
+        let controller = status_controller(
+            connected_test_status(2),
+            Some(live_hid_source(1, Arc::clone(&old))),
+        );
+        assert!(
+            controller
+                .status()
+                .await
+                .expect("stale source status")
+                .hid
+                .is_none(),
+            "generation-one HID must not appear in generation two"
+        );
+
+        let new = Arc::new(parking_lot::RwLock::new(test_hid_status(0, 0, 2, true)));
+        *controller.live_hid.write() = Some(live_hid_source(2, Arc::clone(&new)));
+        let status = controller.status().await.expect("new generation status");
+        assert_eq!(status.hid.expect("new live HID").keyboard_leds, 2);
+
+        *controller.status.write() = connected_test_status(3);
+        assert!(
+            controller
+                .status()
+                .await
+                .expect("next reconnect status")
+                .hid
+                .is_none(),
+            "generation-two HID must not leak into generation three"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_teardown_clears_live_hid_without_mixed_status() {
+        let hid = Arc::new(parking_lot::RwLock::new(test_hid_status(1, 1, 0, true)));
+        let controller = status_controller(
+            connected_test_status(7),
+            Some(live_hid_source(7, Arc::clone(&hid))),
+        );
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let controller = controller.clone();
+            readers.push(tokio::spawn(async move {
+                for _ in 0..100 {
+                    let status = controller.status().await.expect("concurrent status");
+                    if !status.connected {
+                        assert!(status.hid.is_none());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        controller.live_hid.write().take();
+        *controller.status.write() = ControllerStatus {
+            connected: false,
+            state: ConnectionState::Reconnecting,
+            generation: 7,
+            device_version: None,
+            signaling: None,
+            device_capabilities: DeviceCapabilities {
+                check_mount_url: None,
+            },
+            frame: None,
+            hid: None,
+            stale_controller_mount: false,
+            last_error: Some("connection ended".to_owned()),
+        };
+        for reader in readers {
+            reader.await.expect("status reader should not panic");
+        }
+        let status = controller.status().await.expect("teardown status");
+        assert_eq!(status.state, ConnectionState::Reconnecting);
+        assert!(status.hid.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_actor_failure_clears_connected_state_and_is_stable() {
+        let (connector, _) = ScriptedConnector::new(vec![Script::Pending]);
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _) = broadcast::channel(1);
+        let (nal_tx, _) = broadcast::channel(1);
+        let (media_event_tx, _) = broadcast::channel(1);
+        let status = Arc::new(parking_lot::RwLock::new(connected_test_status(7)));
+        let hid = Arc::new(parking_lot::RwLock::new(test_hid_status(1, 1, 0, true)));
+        let live_hid = Arc::new(parking_lot::RwLock::new(Some(live_hid_source(
+            7,
+            Arc::clone(&hid),
+        ))));
+        let actor_error = Arc::new(parking_lot::Mutex::new(None));
+        let mut actor = Actor::new(
+            test_config(),
+            connector,
+            ActorChannels {
+                command_rx,
+                event_tx: event_tx.clone(),
+                nal_tx: nal_tx.clone(),
+                media_event_tx,
+            },
+            ActorShared {
+                shutdown: CancellationToken::new(),
+                error: Arc::clone(&actor_error),
+                status: Arc::clone(&status),
+                live_hid: Arc::clone(&live_hid),
+                cache: LatestFrameCache::new(),
+            },
+        )
+        .expect("test actor");
+        actor.generation = 7;
+        let (disconnect_tx, disconnect_rx) = oneshot::channel();
+        let phase = actor.finish_disconnect(
+            disconnect_tx,
+            Err(anyhow!(
+                "disconnect cleanup failed for test-password at \
+                 http://host/jetkvm-controller/media/secret-token"
+            )),
+        );
+        let disconnect_error = disconnect_rx
+            .await
+            .expect("disconnect response")
+            .expect_err("disconnect cleanup fails");
+        assert_eq!(
+            crate::error::error_code(&disconnect_error),
+            codes::OPERATION_FAILED
+        );
+        let Phase::Shutdown(result) = phase else {
+            panic!("disconnect cleanup failure must terminate the actor");
+        };
+        actor.publish_terminal_failure(&result.expect_err("terminal disconnect error"));
+
+        let Phase::Shutdown(shutdown_result) =
+            actor.finish_shutdown(Err(anyhow!("shutdown cleanup failed for test-password")))
+        else {
+            panic!("shutdown cleanup result must terminate the actor");
+        };
+        assert!(
+            shutdown_result
+                .expect_err("shutdown cleanup failure is retained")
+                .to_string()
+                .contains("test-password"),
+            "internal error remains available until terminal publication sanitizes it"
+        );
+
+        let terminal = status.read().clone();
+        assert!(!terminal.connected);
+        assert_eq!(terminal.state, ConnectionState::ShuttingDown);
+        assert!(terminal.hid.is_none());
+        assert!(terminal.frame.is_none());
+        assert!(terminal.device_version.is_none());
+        assert!(live_hid.read().is_none());
+        let message = actor_error.lock().clone().expect("terminal error stored");
+        assert!(!message.contains("test-password"));
+        assert!(!message.contains("secret-token"));
+
+        let mut controller = status_controller(terminal, None);
+        let done = CancellationToken::new();
+        done.cancel();
+        controller.status = status;
+        controller.live_hid = live_hid;
+        controller.lifecycle = Arc::new(ControllerLifecycle {
+            shutdown: CancellationToken::new(),
+            done,
+            error: actor_error,
+        });
+
+        let status_error = controller
+            .status()
+            .await
+            .expect_err("terminal status returns an error");
+        let command_error = controller
+            .disconnect()
+            .await
+            .expect_err("subsequent command returns the same terminal error");
+        assert_eq!(
+            crate::error::error_code(&status_error),
+            codes::OPERATION_FAILED
+        );
+        assert_eq!(
+            crate::error::error_code(&command_error),
+            codes::OPERATION_FAILED
+        );
+        assert_eq!(status_error.to_string(), command_error.to_string());
+
+        let mut concurrent = Vec::new();
+        for _ in 0..8 {
+            let controller = controller.clone();
+            concurrent.push(tokio::spawn(async move { controller.shutdown().await }));
+        }
+        for result in concurrent {
+            let error = result
+                .await
+                .expect("concurrent shutdown task")
+                .expect_err("terminal failure remains stable during shutdown");
+            assert_eq!(crate::error::error_code(&error), codes::OPERATION_FAILED);
+            assert_eq!(error.to_string(), status_error.to_string());
+        }
     }
 
     #[test]
