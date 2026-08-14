@@ -84,25 +84,31 @@ standard error. The first request must negotiate protocol version 1:
 ```json
 {"id":1,"method":"hello","params":{"protocol_version":1}}
 {"id":2,"method":"status","params":{}}
-{"id":3,"method":"snapshot","params":{"path":"/tmp/jetkvm.png"}}
-{"id":4,"method":"shutdown","params":{}}
+{"id":3,"method":"snapshot","params":{}}
+{"id":4,"method":"snapshot","params":{"path":"/tmp/jetkvm.png","approved":true}}
+{"id":5,"method":"shutdown","params":{}}
 ```
 
 Responses carry the matching `id`; asynchronous connection, takeover, and upload
 progress messages carry an `event` field. Request IDs are strings or integers.
 Use `cancel` with the target request ID to cancel an in-flight operation.
-Mutating virtual-media methods require `"approved":true`; callers should set it
-only after explicit user approval. Device firmware can report individual methods
-as `unsupported`.
+`hello` returns the capabilities supported by the connected firmware plus any
+compatibility warnings. A snapshot without `path` is written to
+controller-owned temporary storage and remains available until controller
+shutdown. Caller-selected snapshot paths and all virtual-media operations that
+disclose local paths, mutate device state, or cause the JetKVM to fetch a URL
+require `"approved":true`; set it only after explicit user approval.
 
-The controller prefers current WebSocket signaling and falls back to the legacy
-HTTP offer/answer endpoint. Each replacement connection has a monotonically
-increasing generation. Cached frames and pending RPC responses never cross
-generations.
+The controller uses WebSocket signaling with trickle ICE and falls back to the
+legacy HTTP offer/answer endpoint if the WebSocket handshake or exchange fails.
+Each replacement connection has a monotonically increasing generation. Cached
+frames and pending RPC responses never cross generations.
 
 Local image mounting starts a tokenized, single-file HTTP range server bound only
 to the interface used to reach the JetKVM. Device-storage uploads are resumable,
-cancellable, and validated against free space before transfer.
+cancellable, and validated against free space before transfer. Uploads prefer
+authenticated HTTP and fall back to a bounded, backpressured WebRTC data channel
+when direct HTTP is unavailable.
 
 ## Security
 
@@ -110,9 +116,9 @@ cancellable, and validated against free space before transfer.
   encryption. Use it only on a trusted LAN; prefer HTTPS.
 - `--no-tls-verify` disables certificate authentication. Use it only for a
   device certificate you have verified by another channel.
-- The stdio peer can request HID actions and reads of explicitly named local
-  image paths. Run the controller only as the intended desktop user and treat
-  the parent process as trusted.
+- The stdio peer can request HID actions and approved reads or writes of explicitly
+  named local paths. Run the controller only as the intended desktop user and
+  treat the parent process as trusted.
 - Controller output redacts authentication headers, upload IDs, and local range
   tokens. Do not forward device or FFmpeg debug logs to untrusted consumers.
 - `ffmpeg-the-third` links the system FFmpeg libraries. Binary distributors must

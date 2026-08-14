@@ -91,10 +91,3 @@ pub async fn authenticate(
         no_tls_verify,
     })
 }
-
-pub async fn login(host: &str, password: &str, no_tls_verify: bool) -> Result<Client> {
-    Ok(authenticate(host, password, no_tls_verify)
-        .await?
-        .client
-        .clone())
-}

@@ -1,17 +1,23 @@
-pub mod auth;
+mod auth;
 pub mod config;
 pub mod control_protocol;
 pub mod controller;
 pub mod detector;
-pub mod h264;
-pub mod hid;
-pub mod keyboard;
-pub mod paths;
-pub mod range_server;
+mod h264;
+mod hid;
+mod keyboard;
+mod paths;
+mod range_server;
 pub mod recorder;
-pub mod rpc;
-pub mod screenshot;
-pub mod session;
-pub mod signaling;
-pub mod video;
-pub mod virtual_media;
+mod rpc;
+mod screenshot;
+mod session;
+mod signaling;
+mod video;
+mod virtual_media;
+
+pub use hid::{AbsoluteMouseEvent, HidStatus, KeyEvent, RelativeMouseEvent};
+pub use virtual_media::Approval;
+
+pub use h264::NalUnit;
+pub use rpc::{MountUrlInfo, StorageFile, StorageSpace, VirtualMediaMode, VirtualMediaState};

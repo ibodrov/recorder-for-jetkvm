@@ -6,6 +6,7 @@ use clap::Parser;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
+use recorder_for_jetkvm::Approval;
 use recorder_for_jetkvm::config::{CliCommand, Config};
 use recorder_for_jetkvm::controller::{ConnectionConfig, JetKvmController};
 use recorder_for_jetkvm::{control_protocol, detector, recorder};
@@ -81,7 +82,7 @@ async fn run_recording(config: &Config, controller: JetKvmController) -> Result<
 
 async fn run_screenshot(controller: JetKvmController, output_path: &Path) -> Result<()> {
     let snapshot = tokio::select! {
-        result = controller.snapshot(output_path.to_owned()) => result?,
+        result = controller.snapshot_to(output_path.to_owned(), Approval { approved: true }) => result?,
         _ = tokio::signal::ctrl_c() => {
             controller.shutdown().await?;
             return Err(anyhow!("received shutdown signal before screenshot capture"));

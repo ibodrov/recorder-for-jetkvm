@@ -1,5 +1,6 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
@@ -16,7 +17,7 @@ use crate::keyboard;
 use crate::rpc::{MountUrlInfo, StorageFile, StorageSpace, VirtualMediaMode, VirtualMediaState};
 use crate::session::SessionConnection;
 use crate::signaling::SignalingMode;
-use crate::video::{LatestFrameCache, SnapshotFile};
+use crate::video::{LatestFrameCache, ParameterSets, SnapshotFile};
 use crate::virtual_media::{Approval, MediaEvent, VirtualMediaManager};
 
 const COMMAND_BUFFER: usize = 64;
@@ -158,20 +159,51 @@ pub struct JetKvmController {
     command_tx: mpsc::Sender<Command>,
     event_tx: broadcast::Sender<ControllerEvent>,
     nal_tx: broadcast::Sender<NalUnit>,
+    lifecycle: Arc<ControllerLifecycle>,
+}
+
+struct ControllerLifecycle {
+    shutdown: CancellationToken,
+    done: CancellationToken,
+    error: Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+struct ActorRuntime {
+    event_tx: broadcast::Sender<ControllerEvent>,
+    nal_tx: broadcast::Sender<NalUnit>,
+    media_event_tx: broadcast::Sender<MediaEvent>,
+    ready_tx: oneshot::Sender<Result<()>>,
+    shutdown: CancellationToken,
+    error: Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+impl Drop for ControllerLifecycle {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 enum Command {
     Status(oneshot::Sender<Result<ControllerStatus>>),
     Connect(oneshot::Sender<Result<ControllerStatus>>),
     Disconnect(oneshot::Sender<Result<()>>),
-    Snapshot(PathBuf, oneshot::Sender<Result<Snapshot>>),
+    Snapshot(oneshot::Sender<Result<Snapshot>>),
+    SnapshotTo {
+        path: PathBuf,
+        approval: Approval,
+        response: oneshot::Sender<Result<Snapshot>>,
+    },
     Key(KeyEvent, oneshot::Sender<Result<()>>),
     TypeText(TypeTextRequest, oneshot::Sender<Result<()>>),
     AbsoluteMouse(AbsoluteMouseEvent, oneshot::Sender<Result<()>>),
     RelativeMouse(RelativeMouseEvent, oneshot::Sender<Result<()>>),
     Scroll(ScrollEvent, oneshot::Sender<Result<()>>),
     MediaState(oneshot::Sender<Result<Option<VirtualMediaState>>>),
-    CheckMountUrl(String, oneshot::Sender<Result<MountUrlInfo>>),
+    CheckMountUrl {
+        url: String,
+        approval: Approval,
+        response: oneshot::Sender<Result<MountUrlInfo>>,
+    },
     MountUrl {
         url: String,
         mode: VirtualMediaMode,
@@ -205,13 +237,12 @@ enum Command {
         approval: Approval,
         response: oneshot::Sender<Result<()>>,
     },
-    Shutdown(oneshot::Sender<Result<()>>),
 }
 
 enum ActorDirective {
     Continue,
     Disconnect(Option<oneshot::Sender<Result<()>>>),
-    Shutdown(oneshot::Sender<Result<()>>),
+    Shutdown(Option<oneshot::Sender<Result<()>>>),
 }
 
 impl JetKvmController {
@@ -221,17 +252,34 @@ impl JetKvmController {
         let (nal_tx, _) = broadcast::channel(NAL_BUFFER);
         let (media_event_tx, mut media_event_rx) = broadcast::channel(EVENT_BUFFER);
         let (ready_tx, ready_rx) = oneshot::channel();
+        let shutdown = CancellationToken::new();
+        let done = CancellationToken::new();
+        let error = Arc::new(parking_lot::Mutex::new(None));
+        let lifecycle = Arc::new(ControllerLifecycle {
+            shutdown: shutdown.clone(),
+            done: done.clone(),
+            error: Arc::clone(&error),
+        });
 
         let actor_event_tx = event_tx.clone();
+        let run_event_tx = actor_event_tx.clone();
         let actor_nal_tx = nal_tx.clone();
-        tokio::spawn(run_actor(
-            config,
-            command_rx,
-            actor_event_tx.clone(),
-            actor_nal_tx,
-            media_event_tx,
-            ready_tx,
-        ));
+        tokio::spawn(async move {
+            run_actor(
+                config,
+                command_rx,
+                ActorRuntime {
+                    event_tx: run_event_tx,
+                    nal_tx: actor_nal_tx,
+                    media_event_tx,
+                    ready_tx,
+                    shutdown,
+                    error,
+                },
+            )
+            .await;
+            done.cancel();
+        });
         tokio::spawn(async move {
             loop {
                 match media_event_rx.recv().await {
@@ -263,6 +311,7 @@ impl JetKvmController {
             command_tx,
             event_tx,
             nal_tx,
+            lifecycle,
         })
     }
 
@@ -286,9 +335,15 @@ impl JetKvmController {
         request(&self.command_tx, Command::Disconnect).await
     }
 
-    pub async fn snapshot(&self, path: PathBuf) -> Result<Snapshot> {
-        request_with(&self.command_tx, |response| {
-            Command::Snapshot(path, response)
+    pub async fn snapshot(&self) -> Result<Snapshot> {
+        request(&self.command_tx, Command::Snapshot).await
+    }
+
+    pub async fn snapshot_to(&self, path: PathBuf, approval: Approval) -> Result<Snapshot> {
+        request_with(&self.command_tx, |response| Command::SnapshotTo {
+            path,
+            approval,
+            response,
         })
         .await
     }
@@ -329,9 +384,11 @@ impl JetKvmController {
         request(&self.command_tx, Command::MediaState).await
     }
 
-    pub async fn check_mount_url(&self, url: String) -> Result<MountUrlInfo> {
-        request_with(&self.command_tx, |response| {
-            Command::CheckMountUrl(url, response)
+    pub async fn check_mount_url(&self, url: String, approval: Approval) -> Result<MountUrlInfo> {
+        request_with(&self.command_tx, |response| Command::CheckMountUrl {
+            url,
+            approval,
+            response,
         })
         .await
     }
@@ -423,7 +480,17 @@ impl JetKvmController {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        request(&self.command_tx, Command::Shutdown).await
+        self.lifecycle.shutdown.cancel();
+        tokio::time::timeout(
+            SHUTDOWN_TIMEOUT + Duration::from_secs(2),
+            self.lifecycle.done.cancelled(),
+        )
+        .await
+        .context("controller actor did not stop within the shutdown deadline")?;
+        if let Some(error) = self.lifecycle.error.lock().clone() {
+            return Err(anyhow!(error));
+        }
+        Ok(())
     }
 }
 
@@ -451,15 +518,36 @@ async fn request_with<T>(
 async fn run_actor(
     config: ConnectionConfig,
     mut command_rx: mpsc::Receiver<Command>,
-    event_tx: broadcast::Sender<ControllerEvent>,
-    nal_tx: broadcast::Sender<NalUnit>,
-    media_event_tx: broadcast::Sender<MediaEvent>,
-    ready_tx: oneshot::Sender<Result<()>>,
+    runtime: ActorRuntime,
 ) {
+    let ActorRuntime {
+        event_tx,
+        nal_tx,
+        media_event_tx,
+        ready_tx,
+        shutdown,
+        error: actor_error,
+    } = runtime;
+    let snapshot_directory = match tempfile::Builder::new()
+        .prefix("recorder-for-jetkvm-")
+        .tempdir()
+    {
+        Ok(directory) => directory,
+        Err(error) => {
+            let _ = ready_tx.send(Err(error).context("failed to create snapshot directory"));
+            return;
+        }
+    };
+    let mut next_snapshot_id = 1_u64;
     let cache = LatestFrameCache::new();
+    let mut parameter_sets = ParameterSets::default();
+    let mut parameter_rx = nal_tx.subscribe();
     let mut generation = 1_u64;
-    let initial = connect_once(&config, generation, nal_tx.clone()).await;
-    let (mut session, auth, keyframe_tx) = match initial {
+    let initial = tokio::select! {
+        _ = shutdown.cancelled() => return,
+        result = connect_once(&config, generation, nal_tx.clone()) => result,
+    };
+    let (mut session, auth, mut keyframe_tx) = match initial {
         Ok(connection) => connection,
         Err(error) => {
             let _ = ready_tx.send(Err(error));
@@ -467,20 +555,23 @@ async fn run_actor(
         }
     };
     let _ = ready_tx.send(Ok(()));
+    let initial_supports_check_mount_url = supports_check_mount_url(session.device_version());
+    if !initial_supports_check_mount_url {
+        warn!(
+            device_version = ?session.device_version(),
+            "JetKVM firmware does not support checkMountUrl; preflight URL checks are disabled"
+        );
+    }
     let mut media = VirtualMediaManager::new(
         session.rpc().clone(),
         auth,
         session.hid().clone(),
+        session.peer_connection(),
+        initial_supports_check_mount_url,
         media_event_tx.clone(),
     );
     let _ = media.refresh_state().await;
-    let mut decoder = crate::video::spawn_decoder(
-        nal_tx.subscribe(),
-        cache.clone(),
-        generation,
-        keyframe_tx,
-        session.cancellation(),
-    );
+    let mut decoder: Option<tokio::task::JoinHandle<Result<()>>> = None;
     let mut keepalive = session.hid().start_keepalive(session.cancellation());
     let mut reconnect_backoff = config.reconnect_min;
 
@@ -494,17 +585,28 @@ async fn run_actor(
         let mut taken_over = false;
         let directive = loop {
             tokio::select! {
+                _ = shutdown.cancelled() => {
+                    break ActorDirective::Shutdown(None);
+                }
                 command = command_rx.recv() => {
                     let Some(command) = command else {
-                        break ActorDirective::Shutdown(closed_response());
+                        break ActorDirective::Shutdown(None);
                     };
                     match handle_connected_command(
                         command,
-                        &status,
-                        &session,
-                        &mut media,
-                        &cache,
-                        generation,
+                        ConnectedCommandContext {
+                            initial_status: &status,
+                            session: &session,
+                            media: &mut media,
+                            cache: &cache,
+                            nal_tx: &nal_tx,
+                            keyframe_tx: &keyframe_tx,
+                            decoder: &mut decoder,
+                            parameter_sets: &parameter_sets,
+                            snapshot_directory: snapshot_directory.path(),
+                            next_snapshot_id: &mut next_snapshot_id,
+                            generation,
+                        },
                     ).await {
                         ActorDirective::Continue => {}
                         directive => break directive,
@@ -517,6 +619,13 @@ async fn run_actor(
                     } else {
                         ActorDirective::Continue
                     };
+                }
+                parameter = parameter_rx.recv() => {
+                    match parameter {
+                        Ok(nal) => parameter_sets.observe(&nal),
+                        Err(broadcast::error::RecvError::Lagged(_)) => parameter_sets.clear(),
+                        Err(broadcast::error::RecvError::Closed) => {}
+                    }
                 }
                 notification = notifications.recv() => {
                     if let Ok(notification) = notification
@@ -540,33 +649,37 @@ async fn run_actor(
                     state: ConnectionState::ShuttingDown,
                     generation,
                 });
+                if let Some(decoder) = decoder.take() {
+                    decoder.abort();
+                }
+                keepalive.abort();
                 let cleanup = async {
-                    media.clean_shutdown().await?;
-                    session.shutdown().await?;
-                    Result::<()>::Ok(())
+                    let media_result = media.clean_shutdown().await;
+                    let session_result = session.shutdown().await;
+                    media_result.and(session_result)
                 };
                 let result = tokio::time::timeout(SHUTDOWN_TIMEOUT, cleanup)
                     .await
                     .context("controller shutdown timed out")
                     .and_then(|result| result);
-                decoder.abort();
-                keepalive.abort();
-                let _ = response.send(result);
+                finish_actor(result, response, &actor_error);
                 break 'actor;
             }
             ActorDirective::Disconnect(response) => {
-                let result = async {
-                    media.clean_shutdown().await?;
-                    session.shutdown().await
+                if let Some(decoder) = decoder.take() {
+                    decoder.abort();
                 }
-                .await;
-                decoder.abort();
                 keepalive.abort();
                 cache.clear();
-                let failed = result.is_err();
-                if let Some(response) = response {
-                    let _ = response.send(result);
+                parameter_sets.clear();
+                let result = async {
+                    let media_result = media.clean_shutdown().await;
+                    let session_result = session.shutdown().await;
+                    media_result.and(session_result)
                 }
+                .await;
+                let failed = result.is_err();
+                finish_actor(result, response, &actor_error);
                 if failed {
                     break 'actor;
                 }
@@ -575,7 +688,11 @@ async fn run_actor(
                     generation,
                 });
                 loop {
-                    let Some(command) = command_rx.recv().await else {
+                    let command = tokio::select! {
+                        _ = shutdown.cancelled() => break 'actor,
+                        command = command_rx.recv() => command,
+                    };
+                    let Some(command) = command else {
                         break 'actor;
                     };
                     match command {
@@ -591,23 +708,23 @@ async fn run_actor(
                                 state: ConnectionState::Connecting,
                                 generation,
                             });
-                            match connect_once(&config, generation, nal_tx.clone()).await {
-                                Ok((new_session, auth, keyframe_tx)) => {
+                            let connected = tokio::select! {
+                                _ = shutdown.cancelled() => break 'actor,
+                                result = connect_once(&config, generation, nal_tx.clone()) => result,
+                            };
+                            match connected {
+                                Ok((new_session, auth, new_keyframe_tx)) => {
                                     session = new_session;
+                                    keyframe_tx = new_keyframe_tx;
                                     media = VirtualMediaManager::new(
                                         session.rpc().clone(),
                                         auth,
                                         session.hid().clone(),
+                                        session.peer_connection(),
+                                        supports_check_mount_url(session.device_version()),
                                         media_event_tx.clone(),
                                     );
                                     let _ = media.refresh_state().await;
-                                    decoder = crate::video::spawn_decoder(
-                                        nal_tx.subscribe(),
-                                        cache.clone(),
-                                        generation,
-                                        keyframe_tx,
-                                        session.cancellation(),
-                                    );
                                     keepalive =
                                         session.hid().start_keepalive(session.cancellation());
                                     let _ = response.send(Ok(connected_status(
@@ -623,10 +740,6 @@ async fn run_actor(
                         Command::Disconnect(response) => {
                             let _ = response.send(Ok(()));
                         }
-                        Command::Shutdown(response) => {
-                            let _ = response.send(Ok(()));
-                            break 'actor;
-                        }
                         command => reject_not_connected(command),
                     }
                 }
@@ -635,23 +748,57 @@ async fn run_actor(
                 session.rpc().cancel_generation();
                 let _ = session.hid().reset().await;
                 let _ = session.shutdown().await;
-                decoder.abort();
+                if let Some(decoder) = decoder.take() {
+                    decoder.abort();
+                }
                 keepalive.abort();
                 cache.clear();
+                parameter_sets.clear();
                 if taken_over {
                     warn!(generation, "JetKVM controller session was taken over");
                 }
             }
         }
 
-        let (new_session, auth, keyframe_tx) = loop {
+        let (new_session, auth, new_keyframe_tx) = loop {
             generation = generation.saturating_add(1);
             let _ = event_tx.send(ControllerEvent::ConnectionState {
                 state: ConnectionState::Reconnecting,
                 generation,
             });
-            tokio::time::sleep(reconnect_backoff).await;
-            match connect_once(&config, generation, nal_tx.clone()).await {
+            let slept = tokio::select! {
+                _ = shutdown.cancelled() => false,
+                _ = tokio::time::sleep(reconnect_backoff) => true,
+            };
+            if !slept {
+                let _ = event_tx.send(ControllerEvent::ConnectionState {
+                    state: ConnectionState::ShuttingDown,
+                    generation,
+                });
+                let result = tokio::time::timeout(SHUTDOWN_TIMEOUT, media.clean_shutdown())
+                    .await
+                    .context("controller shutdown timed out")
+                    .and_then(|result| result);
+                finish_actor(result, None, &actor_error);
+                break 'actor;
+            }
+            let connected = tokio::select! {
+                _ = shutdown.cancelled() => None,
+                result = connect_once(&config, generation, nal_tx.clone()) => Some(result),
+            };
+            let Some(connected) = connected else {
+                let _ = event_tx.send(ControllerEvent::ConnectionState {
+                    state: ConnectionState::ShuttingDown,
+                    generation,
+                });
+                let result = tokio::time::timeout(SHUTDOWN_TIMEOUT, media.clean_shutdown())
+                    .await
+                    .context("controller shutdown timed out")
+                    .and_then(|result| result);
+                finish_actor(result, None, &actor_error);
+                break 'actor;
+            };
+            match connected {
                 Ok(connection) => break connection,
                 Err(error) => {
                     warn!(%error, generation, "controller reconnect failed");
@@ -660,17 +807,38 @@ async fn run_actor(
             }
         };
         session = new_session;
-        media.rebind(session.rpc().clone(), session.hid().clone(), auth);
-        let _ = media.refresh_state().await;
-        decoder = crate::video::spawn_decoder(
-            nal_tx.subscribe(),
-            cache.clone(),
-            generation,
-            keyframe_tx,
-            session.cancellation(),
+        keyframe_tx = new_keyframe_tx;
+        media.rebind(
+            session.rpc().clone(),
+            session.hid().clone(),
+            session.peer_connection(),
+            auth,
+            supports_check_mount_url(session.device_version()),
         );
+        let _ = media.refresh_state().await;
         keepalive = session.hid().start_keepalive(session.cancellation());
         reconnect_backoff = config.reconnect_min;
+    }
+}
+
+fn finish_actor(
+    result: Result<()>,
+    response: Option<oneshot::Sender<Result<()>>>,
+    actor_error: &parking_lot::Mutex<Option<String>>,
+) {
+    match result {
+        Ok(()) => {
+            if let Some(response) = response {
+                let _ = response.send(Ok(()));
+            }
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            *actor_error.lock() = Some(message.clone());
+            if let Some(response) = response {
+                let _ = response.send(Err(anyhow!(message)));
+            }
+        }
     }
 }
 
@@ -691,6 +859,29 @@ async fn connect_once(
     )
     .await?;
     Ok((session, auth, keyframe_tx))
+}
+
+pub(crate) fn supports_check_mount_url(device_version: Option<&str>) -> bool {
+    let Some(version) = device_version else {
+        return false;
+    };
+    let mut parts = version.trim_start_matches('v').split('.');
+    let Some(major) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+        return false;
+    };
+    let Some(minor) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+        return false;
+    };
+    let Some(patch) = parts.next().and_then(|part| {
+        let digits = part
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>();
+        digits.parse::<u64>().ok()
+    }) else {
+        return false;
+    };
+    (major, minor, patch) >= (0, 5, 9)
 }
 
 fn connected_status(
@@ -723,14 +914,37 @@ fn connected_status(
     }
 }
 
+struct ConnectedCommandContext<'a> {
+    initial_status: &'a ControllerStatus,
+    session: &'a SessionConnection,
+    media: &'a mut VirtualMediaManager,
+    cache: &'a LatestFrameCache,
+    nal_tx: &'a broadcast::Sender<NalUnit>,
+    keyframe_tx: &'a mpsc::Sender<()>,
+    decoder: &'a mut Option<tokio::task::JoinHandle<Result<()>>>,
+    parameter_sets: &'a ParameterSets,
+    snapshot_directory: &'a Path,
+    next_snapshot_id: &'a mut u64,
+    generation: u64,
+}
+
 async fn handle_connected_command(
     command: Command,
-    initial_status: &ControllerStatus,
-    session: &SessionConnection,
-    media: &mut VirtualMediaManager,
-    cache: &LatestFrameCache,
-    generation: u64,
+    context: ConnectedCommandContext<'_>,
 ) -> ActorDirective {
+    let ConnectedCommandContext {
+        initial_status,
+        session,
+        media,
+        cache,
+        nal_tx,
+        keyframe_tx,
+        decoder,
+        parameter_sets,
+        snapshot_directory,
+        next_snapshot_id,
+        generation,
+    } = context;
     match command {
         Command::Status(response) | Command::Connect(response) => {
             let mut status = initial_status.clone();
@@ -748,11 +962,52 @@ async fn handle_connected_command(
         Command::Disconnect(response) => {
             return ActorDirective::Disconnect(Some(response));
         }
-        Command::Snapshot(path, response) => {
-            let result = cache
-                .snapshot(&path, generation, SNAPSHOT_TIMEOUT)
-                .await
-                .map(Snapshot::from);
+        Command::Snapshot(response) => {
+            let path =
+                snapshot_directory.join(format!("snapshot-{generation}-{next_snapshot_id}.png"));
+            *next_snapshot_id = next_snapshot_id.saturating_add(1);
+            let result = async {
+                ensure_decoder(
+                    decoder,
+                    nal_tx,
+                    cache,
+                    generation,
+                    keyframe_tx,
+                    session,
+                    parameter_sets,
+                )
+                .await?;
+                cache
+                    .snapshot(&path, generation, SNAPSHOT_TIMEOUT)
+                    .await
+                    .map(Snapshot::from)
+            }
+            .await;
+            let _ = response.send(result);
+        }
+        Command::SnapshotTo {
+            path,
+            approval,
+            response,
+        } => {
+            let result = async {
+                approval.require("write a snapshot to a caller-selected path")?;
+                ensure_decoder(
+                    decoder,
+                    nal_tx,
+                    cache,
+                    generation,
+                    keyframe_tx,
+                    session,
+                    parameter_sets,
+                )
+                .await?;
+                cache
+                    .snapshot(&path, generation, SNAPSHOT_TIMEOUT)
+                    .await
+                    .map(Snapshot::from)
+            }
+            .await;
             let _ = response.send(result);
         }
         Command::Key(event, response) => {
@@ -777,8 +1032,20 @@ async fn handle_connected_command(
         Command::MediaState(response) => {
             let _ = response.send(media.refresh_state().await);
         }
-        Command::CheckMountUrl(url, response) => {
-            let _ = response.send(media.check_url(&url).await);
+        Command::CheckMountUrl {
+            url,
+            approval,
+            response,
+        } => {
+            let result = approval
+                .require("ask JetKVM to fetch a URL")
+                .and_then(|_| validate_mount_check_url(&url))
+                .map(|_| ());
+            let result = match result {
+                Ok(()) => media.check_url(&url).await,
+                Err(error) => Err(error),
+            };
+            let _ = response.send(result);
         }
         Command::MountUrl {
             url,
@@ -829,9 +1096,42 @@ async fn handle_connected_command(
         } => {
             let _ = response.send(media.delete_storage_file(&filename, approval).await);
         }
-        Command::Shutdown(response) => return ActorDirective::Shutdown(response),
     }
     ActorDirective::Continue
+}
+
+async fn ensure_decoder(
+    decoder: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+    nal_tx: &broadcast::Sender<NalUnit>,
+    cache: &LatestFrameCache,
+    generation: u64,
+    keyframe_tx: &mpsc::Sender<()>,
+    session: &SessionConnection,
+    parameter_sets: &ParameterSets,
+) -> Result<()> {
+    if decoder.as_ref().is_some_and(|task| task.is_finished()) {
+        let finished = decoder.take().expect("finished decoder task is present");
+        finished.await.context("video decoder task failed")??;
+    }
+    if decoder.is_none() {
+        *decoder = Some(crate::video::spawn_decoder(
+            nal_tx.subscribe(),
+            cache.clone(),
+            generation,
+            keyframe_tx.clone(),
+            session.cancellation(),
+            parameter_sets.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mount_check_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).context("invalid media URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        anyhow::bail!("media URL must use HTTP or HTTPS and include a host");
+    }
+    Ok(())
 }
 
 fn reject_not_connected(command: Command) {
@@ -847,17 +1147,16 @@ fn reject_not_connected(command: Command) {
         | Command::RelativeMouse(_, response)
         | Command::Scroll(_, response)
         | Command::Unmount(_, response)
-        | Command::DeleteStorage { response, .. }
-        | Command::Shutdown(response) => {
+        | Command::DeleteStorage { response, .. } => {
             let _ = response.send(Err(anyhow!(message)));
         }
-        Command::Snapshot(_, response) => {
+        Command::Snapshot(response) | Command::SnapshotTo { response, .. } => {
             let _ = response.send(Err(anyhow!(message)));
         }
         Command::MediaState(response) => {
             let _ = response.send(Err(anyhow!(message)));
         }
-        Command::CheckMountUrl(_, response) => {
+        Command::CheckMountUrl { response, .. } => {
             let _ = response.send(Err(anyhow!(message)));
         }
         Command::MountUrl { response, .. }
@@ -875,12 +1174,6 @@ fn reject_not_connected(command: Command) {
             let _ = response.send(Err(anyhow!(message)));
         }
     }
-}
-
-fn closed_response() -> oneshot::Sender<Result<()>> {
-    let (sender, receiver) = oneshot::channel();
-    drop(receiver);
-    sender
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -917,5 +1210,14 @@ mod tests {
         assert_eq!(status.generation, 4);
         assert!(status.frame.is_none());
         assert!(status.hid.is_none());
+    }
+
+    #[test]
+    fn firmware_capability_threshold_is_conservative() {
+        assert!(!supports_check_mount_url(None));
+        assert!(!supports_check_mount_url(Some("0.5.8")));
+        assert!(supports_check_mount_url(Some("0.5.9-dev202606301105")));
+        assert!(supports_check_mount_url(Some("0.6.0")));
+        assert!(!supports_check_mount_url(Some("unknown")));
     }
 }

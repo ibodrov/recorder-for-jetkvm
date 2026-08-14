@@ -41,6 +41,14 @@ impl EstablishedSignaling {
     }
 }
 
+impl Drop for EstablishedSignaling {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct SdpMessage {
     #[serde(rename = "type")]
@@ -93,83 +101,21 @@ pub async fn establish(
     auth: &AuthenticatedClient,
     peer_connection: Arc<RTCPeerConnection>,
     offer: &RTCSessionDescription,
-    mut local_candidates: mpsc::Receiver<RTCIceCandidateInit>,
+    local_candidates: mpsc::Receiver<RTCIceCandidateInit>,
+    mut gathering_complete: mpsc::Receiver<()>,
 ) -> Result<(RTCSessionDescription, EstablishedSignaling)> {
-    match open_websocket(auth).await {
-        Ok((mut socket, device_version)) => {
-            let encoded_offer = encode_sdp(offer)?;
-            let message = SignalMessage {
-                kind: "offer".to_owned(),
-                data: serde_json::json!({ "sd": encoded_offer }),
-            };
-            socket
-                .send(Message::Text(serde_json::to_string(&message)?.into()))
+    match establish_websocket(auth, Arc::clone(&peer_connection), offer, local_candidates).await {
+        Ok(established) => Ok(established),
+        Err(_) => {
+            warn!("WebSocket signaling unavailable; using legacy HTTP fallback");
+            tokio::time::timeout(SIGNALING_TIMEOUT, gathering_complete.recv())
                 .await
-                .context("failed to send WebSocket SDP offer")?;
-
-            let answer = tokio::time::timeout(SIGNALING_TIMEOUT, async {
-                loop {
-                    tokio::select! {
-                        candidate = local_candidates.recv() => {
-                            if let Some(candidate) = candidate {
-                                send_candidate(&mut socket, &candidate).await?;
-                            }
-                        }
-                        incoming = socket.next() => {
-                            let message = incoming
-                                .context("WebSocket signaling ended before SDP answer")?
-                                .context("failed to read WebSocket signaling message")?;
-                            if let Some(answer) = process_signal(message, &peer_connection).await? {
-                                break Ok::<_, anyhow::Error>(answer);
-                            }
-                        }
-                    }
-                }
-            })
-            .await
-            .context("WebSocket signaling timed out")??;
-
-            let task_peer = Arc::clone(&peer_connection);
-            let task = tokio::spawn(async move {
-                let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-                loop {
-                    tokio::select! {
-                        _ = heartbeat.tick() => {
-                            if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
-                                return;
-                            }
-                        }
-                        candidate = local_candidates.recv() => {
-                            let Some(candidate) = candidate else {
-                                return;
-                            };
-                            if send_candidate(&mut socket, &candidate).await.is_err() {
-                                return;
-                            }
-                        }
-                        incoming = socket.next() => {
-                            let Some(Ok(message)) = incoming else {
-                                return;
-                            };
-                            if process_signal(message, &task_peer).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-            Ok((
-                answer,
-                EstablishedSignaling {
-                    mode: SignalingMode::WebSocket,
-                    device_version,
-                    task: Some(task),
-                },
-            ))
-        }
-        Err(error) => {
-            warn!(%error, "WebSocket signaling unavailable; using legacy HTTP fallback");
-            let answer = exchange_sdp(auth.client(), auth.base_url(), offer).await?;
+                .context("ICE gathering timed out for legacy signaling")?;
+            let complete_offer = peer_connection
+                .local_description()
+                .await
+                .context("no local description after ICE gathering")?;
+            let answer = exchange_sdp(auth.client(), auth.base_url(), &complete_offer).await?;
             Ok((
                 answer,
                 EstablishedSignaling {
@@ -180,6 +126,84 @@ pub async fn establish(
             ))
         }
     }
+}
+
+async fn establish_websocket(
+    auth: &AuthenticatedClient,
+    peer_connection: Arc<RTCPeerConnection>,
+    offer: &RTCSessionDescription,
+    mut local_candidates: mpsc::Receiver<RTCIceCandidateInit>,
+) -> Result<(RTCSessionDescription, EstablishedSignaling)> {
+    let (mut socket, device_version) = open_websocket(auth).await?;
+    let encoded_offer = encode_sdp(offer)?;
+    let message = SignalMessage {
+        kind: "offer".to_owned(),
+        data: serde_json::json!({ "sd": encoded_offer }),
+    };
+    socket
+        .send(Message::Text(serde_json::to_string(&message)?.into()))
+        .await
+        .context("failed to send WebSocket SDP offer")?;
+
+    let answer = tokio::time::timeout(SIGNALING_TIMEOUT, async {
+        loop {
+            tokio::select! {
+                candidate = local_candidates.recv() => {
+                    if let Some(candidate) = candidate {
+                        send_candidate(&mut socket, &candidate).await?;
+                    }
+                }
+                incoming = socket.next() => {
+                    let message = incoming
+                        .context("WebSocket signaling ended before SDP answer")?
+                        .context("failed to read WebSocket signaling message")?;
+                    if let Some(answer) = process_signal(message, &peer_connection).await? {
+                        break Ok::<_, anyhow::Error>(answer);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .context("WebSocket signaling timed out")??;
+
+    let task_peer = Arc::clone(&peer_connection);
+    let task = tokio::spawn(async move {
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        return;
+                    }
+                }
+                candidate = local_candidates.recv() => {
+                    let Some(candidate) = candidate else {
+                        return;
+                    };
+                    if send_candidate(&mut socket, &candidate).await.is_err() {
+                        return;
+                    }
+                }
+                incoming = socket.next() => {
+                    let Some(Ok(message)) = incoming else {
+                        return;
+                    };
+                    if process_signal(message, &task_peer).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    Ok((
+        answer,
+        EstablishedSignaling {
+            mode: SignalingMode::WebSocket,
+            device_version,
+            task: Some(task),
+        },
+    ))
 }
 
 async fn open_websocket(

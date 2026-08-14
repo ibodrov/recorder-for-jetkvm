@@ -150,12 +150,34 @@ impl AccessUnit {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct ParameterSets {
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+}
+
+impl ParameterSets {
+    pub fn observe(&mut self, nal: &NalUnit) {
+        match nal.nal_type() {
+            Some(7) => self.sps = Some(nal.data.to_vec()),
+            Some(8) => self.pps = Some(nal.data.to_vec()),
+            _ => {}
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.sps = None;
+        self.pps = None;
+    }
+}
+
 pub fn spawn_decoder(
     mut nal_rx: broadcast::Receiver<NalUnit>,
     cache: LatestFrameCache,
     generation: u64,
     keyframe_tx: mpsc::Sender<()>,
     cancellation: CancellationToken,
+    parameter_sets: ParameterSets,
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let codec = ffmpeg_the_third::decoder::find(ffmpeg_the_third::codec::Id::H264)
@@ -167,8 +189,8 @@ pub fn spawn_decoder(
             .video()
             .context("linked H.264 decoder is not a video decoder")?;
 
-        let mut current_sps: Option<Vec<u8>> = None;
-        let mut current_pps: Option<Vec<u8>> = None;
+        let mut current_sps = parameter_sets.sps;
+        let mut current_pps = parameter_sets.pps;
         let mut pending: Option<AccessUnit> = None;
         let mut started = false;
         let _ = keyframe_tx.try_send(());
@@ -343,8 +365,8 @@ mod tests {
             42,
             keyframe_tx,
             cancellation.clone(),
+            ParameterSets::default(),
         );
-
         for nal in crate::recorder::split_annexb_nals(fixture) {
             let mut packet = webrtc::rtp::packet::Packet::default();
             packet.header.timestamp = 90_000;

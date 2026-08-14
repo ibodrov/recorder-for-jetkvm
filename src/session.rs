@@ -78,6 +78,33 @@ pub(crate) struct SessionConnection {
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+struct ConnectionSetupGuard {
+    peer_connection: Arc<RTCPeerConnection>,
+    cancellation: CancellationToken,
+    armed: bool,
+}
+
+impl ConnectionSetupGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectionSetupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.cancellation.cancel();
+        let peer_connection = Arc::clone(&self.peer_connection);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = peer_connection.close().await;
+            });
+        }
+    }
+}
+
 impl SessionConnection {
     pub async fn connect(
         auth: AuthenticatedClient,
@@ -95,7 +122,13 @@ impl SessionConnection {
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
             .build();
+        let cancellation = CancellationToken::new();
         let peer_connection = Arc::new(api.new_peer_connection(RTCConfiguration::default()).await?);
+        let mut setup_guard = ConnectionSetupGuard {
+            peer_connection: Arc::clone(&peer_connection),
+            cancellation: cancellation.clone(),
+            armed: true,
+        };
         peer_connection
             .add_transceiver_from_kind(RTPCodecType::Video, None)
             .await
@@ -138,7 +171,6 @@ impl SessionConnection {
             Arc::clone(&unreliable_ordered),
             Arc::clone(&unreliable_unordered),
         );
-        let cancellation = CancellationToken::new();
         let (state_tx, mut state_rx) = mpsc::channel(16);
         peer_connection.on_peer_connection_state_change(Box::new(move |state| {
             let state_tx = state_tx.clone();
@@ -199,24 +231,20 @@ impl SessionConnection {
             })
         }));
 
-        let depacketizer = tokio::spawn(async move {
-            h264::depacketize(rtp_rx, nal_tx).await;
-        });
         let offer = peer_connection.create_offer(None).await?;
-        peer_connection.set_local_description(offer).await?;
-        let mut gathered = peer_connection.gathering_complete_promise().await;
-        let _ = gathered.recv().await;
-        let local_description = peer_connection
-            .local_description()
-            .await
-            .context("no local description after ICE gathering")?;
+        let gathered = peer_connection.gathering_complete_promise().await;
+        peer_connection.set_local_description(offer.clone()).await?;
         let (answer, signaling) = signaling::establish(
             &auth,
             Arc::clone(&peer_connection),
-            &local_description,
+            &offer,
             candidate_rx,
+            gathered,
         )
         .await?;
+        let depacketizer = tokio::spawn(async move {
+            h264::depacketize(rtp_rx, nal_tx).await;
+        });
         let device_version = signaling.device_version.clone();
         peer_connection.set_remote_description(answer).await?;
         info!(?generation, ?device_version, mode = ?signaling.mode, "WebRTC session established");
@@ -256,6 +284,7 @@ impl SessionConnection {
             }
         });
 
+        setup_guard.disarm();
         Ok(Self {
             peer_connection,
             rpc,
@@ -270,6 +299,10 @@ impl SessionConnection {
 
     pub fn rpc(&self) -> &RpcClient {
         &self.rpc
+    }
+
+    pub fn peer_connection(&self) -> Arc<RTCPeerConnection> {
+        Arc::clone(&self.peer_connection)
     }
 
     pub fn hid(&self) -> &HidClient {
@@ -372,20 +405,31 @@ fn register_h264_codecs(media_engine: &mut MediaEngine) -> Result<()> {
     Ok(())
 }
 
-pub async fn wait_data_channel_open(
+pub(crate) async fn wait_data_channel_open(
     channel: &Arc<RTCDataChannel>,
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<()> {
     tokio::time::timeout(timeout, async {
-        while channel.ready_state()
-            != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
-        {
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        loop {
+            match channel.ready_state() {
+                webrtc::data_channel::data_channel_state::RTCDataChannelState::Open => {
+                    return Ok(());
+                }
+                webrtc::data_channel::data_channel_state::RTCDataChannelState::Closing
+                | webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed => {
+                    anyhow::bail!("data channel closed before opening");
+                }
+                _ => {}
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => anyhow::bail!("operation cancelled"),
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
         }
     })
     .await
-    .context("data channel did not open")?;
-    Ok(())
+    .context("data channel did not open")?
 }
 
 #[cfg(test)]

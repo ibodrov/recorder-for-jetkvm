@@ -9,6 +9,7 @@ use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
@@ -81,27 +82,41 @@ impl RangeServer {
         let file = Arc::new(file);
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_READS));
         let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
-                    _ = task_cancellation.cancelled() => return Ok(()),
+                    _ = task_cancellation.cancelled() => break,
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.context("range server accept failed")?;
                         let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
-                            tokio::spawn(async move {
+                            connections.spawn(async move {
                                 let mut stream = stream;
-                                let _ = write_simple_response(&mut stream, 503, "Service Unavailable", &[]).await;
+                                let _ = write_simple_response(
+                                    &mut stream,
+                                    503,
+                                    "Service Unavailable",
+                                    &[],
+                                ).await;
                             });
                             continue;
                         };
                         let file = Arc::clone(&file);
                         let route = route.clone();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             let _permit = permit;
                             let _ = handle_connection(stream, file, file_size, &route).await;
                         });
                     }
+                    completed = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(error)) = completed {
+                            return Err(error).context("range server connection task failed");
+                        }
+                    }
                 }
             }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+            Ok(())
         });
 
         Ok(Self {
@@ -116,14 +131,30 @@ impl RangeServer {
         &self.mount_url
     }
 
-    pub fn file_path(&self) -> &Path {
-        &self.file_path
+    pub fn is_healthy(&self) -> bool {
+        !self.task.is_finished()
     }
 
-    pub async fn shutdown(self) -> Result<()> {
-        self.cancellation.cancel();
-        self.task.await.context("range server task failed")??;
+    pub fn ensure_healthy(&self) -> Result<()> {
+        if !self.is_healthy() {
+            bail!("local media server stopped unexpectedly");
+        }
         Ok(())
+    }
+
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.cancellation.cancel();
+        (&mut self.task)
+            .await
+            .context("range server task failed")??;
+        Ok(())
+    }
+}
+
+impl Drop for RangeServer {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.task.abort();
     }
 }
 
@@ -419,5 +450,29 @@ mod tests {
             404
         );
         server.shutdown().await.expect("range server shutdown");
+    }
+
+    #[tokio::test]
+    async fn dropping_server_stops_listener() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("image.iso");
+        tokio::fs::write(&path, b"0123456789")
+            .await
+            .expect("fixture write");
+        let server = RangeServer::start_on(&path, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .expect("range server should start");
+        let url = server.mount_url().to_owned();
+        drop(server);
+
+        let result = reqwest::Client::new()
+            .get(url)
+            .timeout(std::time::Duration::from_secs(1))
+            .send()
+            .await;
+        assert!(
+            result.is_err(),
+            "range listener remained reachable after drop"
+        );
     }
 }

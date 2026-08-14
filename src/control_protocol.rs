@@ -21,6 +21,7 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 const OUTPUT_BUFFER: usize = 128;
 
 const MAX_ACTIVE_REQUESTS: usize = 64;
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[derive(Debug, Deserialize)]
 struct Request {
     id: Value,
@@ -54,12 +55,17 @@ struct HelloParams {
 
 #[derive(Debug, Deserialize)]
 struct SnapshotParams {
-    path: PathBuf,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    approved: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct UrlParams {
     url: String,
+    #[serde(default)]
+    approved: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,18 +242,26 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                                 continue;
                             }
                             handshake_complete = true;
+                            let status = controller.status().await?;
+                            let supports_check_mount_url =
+                                crate::controller::supports_check_mount_url(
+                                    status.device_version.as_deref(),
+                                );
+                            let warnings = if supports_check_mount_url {
+                                Vec::new()
+                            } else {
+                                vec![
+                                    "JetKVM firmware does not support checkMountUrl; \
+                                     preflight URL checks are disabled",
+                                ]
+                            };
                             send_success(
                                 &output_tx,
                                 request.id,
                                 serde_json::json!({
                                     "protocol_version": PROTOCOL_VERSION,
-                                    "capabilities": [
-                                        "connect", "disconnect", "status", "snapshot", "key",
-                                        "type_text", "mouse_move", "mouse_button", "mouse_scroll",
-                                        "media_state", "check_mount_url", "mount_url", "mount_local",
-                                        "unmount", "storage_space", "storage_files", "upload",
-                                        "mount_storage", "delete_storage", "cancel", "shutdown"
-                                    ]
+                                    "capabilities": capability_names(supports_check_mount_url),
+                                    "warnings": warnings,
                                 }),
                             ).await?;
                             continue;
@@ -315,12 +329,18 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                             let id = request.id.clone();
                             let method = request.method;
                             let dispatch_cancellation = cancellation.clone();
-                            let operation = dispatch(
-                                &request_controller,
-                                &method,
-                                request.params,
-                                dispatch_cancellation,
-                            );
+                            let operation = async {
+                                if method == "shutdown" {
+                                    wait_for_prior_requests(&request_active, &key).await?;
+                                }
+                                dispatch(
+                                    &request_controller,
+                                    &method,
+                                    request.params,
+                                    dispatch_cancellation,
+                                )
+                                .await
+                            };
                             let result = if method == "upload" {
                                 operation.await
                             } else {
@@ -385,7 +405,20 @@ async fn dispatch(
         "status" => to_value(controller.status().await?),
         "snapshot" => {
             let params = parse_params::<SnapshotParams>(params)?;
-            to_value(controller.snapshot(params.path).await?)
+            let snapshot = match params.path {
+                Some(path) => {
+                    controller
+                        .snapshot_to(
+                            path,
+                            Approval {
+                                approved: params.approved,
+                            },
+                        )
+                        .await?
+                }
+                None => controller.snapshot().await?,
+            };
+            to_value(snapshot)
         }
         "key" => {
             controller.key(parse_params(params)?).await?;
@@ -413,7 +446,16 @@ async fn dispatch(
         "media_state" => to_value(controller.media_state().await?),
         "check_mount_url" => {
             let params = parse_params::<UrlParams>(params)?;
-            to_value(controller.check_mount_url(params.url).await?)
+            to_value(
+                controller
+                    .check_mount_url(
+                        params.url,
+                        Approval {
+                            approved: params.approved,
+                        },
+                    )
+                    .await?,
+            )
         }
         "mount_url" => {
             let params = parse_params::<MountUrlParams>(params)?;
@@ -502,6 +544,54 @@ async fn dispatch(
         }
         _ => anyhow::bail!("unknown control method"),
     }
+}
+fn capability_names(supports_check_mount_url: bool) -> Vec<&'static str> {
+    let mut capabilities = vec![
+        "connect",
+        "disconnect",
+        "status",
+        "snapshot",
+        "key",
+        "type_text",
+        "mouse_move",
+        "mouse_button",
+        "mouse_scroll",
+        "media_state",
+        "mount_url",
+        "mount_local",
+        "unmount",
+        "storage_space",
+        "storage_files",
+        "upload",
+        "mount_storage",
+        "delete_storage",
+        "cancel",
+        "shutdown",
+    ];
+    if supports_check_mount_url {
+        capabilities.push("check_mount_url");
+    }
+    capabilities
+}
+
+async fn wait_for_prior_requests(
+    active: &Mutex<HashMap<String, CancellationToken>>,
+    shutdown_key: &str,
+) -> Result<()> {
+    tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+        loop {
+            let drained = {
+                let active = active.lock().await;
+                active.len() == 1 && active.contains_key(shutdown_key)
+            };
+            if drained {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for active requests before shutdown")
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Value) -> Result<T> {
@@ -676,5 +766,27 @@ mod tests {
         assert!(valid_id(&serde_json::json!("one")));
         assert!(!valid_id(&Value::Null));
         assert!(!valid_id(&serde_json::json!(1.5)));
+    }
+
+    #[test]
+    fn snapshot_paths_require_explicit_opt_in() {
+        let owned: SnapshotParams =
+            serde_json::from_value(serde_json::json!({})).expect("default snapshot params");
+        assert!(owned.path.is_none());
+        assert!(!owned.approved);
+
+        let selected: SnapshotParams = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/selected.png",
+            "approved": true,
+        }))
+        .expect("selected snapshot params");
+        assert_eq!(selected.path, Some(PathBuf::from("/tmp/selected.png")));
+        assert!(selected.approved);
+    }
+
+    #[test]
+    fn firmware_capabilities_omit_unsupported_url_check() {
+        assert!(!capability_names(false).contains(&"check_mount_url"));
+        assert!(capability_names(true).contains(&"check_mount_url"));
     }
 }

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -7,8 +8,11 @@ use futures_util::stream;
 use reqwest::Body;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::auth::AuthenticatedClient;
 use crate::hid::HidClient;
@@ -19,6 +23,8 @@ use crate::rpc::{
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 const UPLOAD_CHUNK_SIZE: usize = 64 * 1024;
+const DATA_CHANNEL_BUFFER_LOW: usize = 512 * 1024;
+const DATA_CHANNEL_BUFFER_HIGH: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Approval {
@@ -50,6 +56,8 @@ pub(crate) struct VirtualMediaManager {
     rpc: RpcClient,
     auth: AuthenticatedClient,
     hid: HidClient,
+    peer_connection: Arc<RTCPeerConnection>,
+    supports_check_mount_url: bool,
     events: broadcast::Sender<MediaEvent>,
     range_server: Option<RangeServer>,
     stale_controller_mount: bool,
@@ -60,23 +68,36 @@ impl VirtualMediaManager {
         rpc: RpcClient,
         auth: AuthenticatedClient,
         hid: HidClient,
+        peer_connection: Arc<RTCPeerConnection>,
+        supports_check_mount_url: bool,
         events: broadcast::Sender<MediaEvent>,
     ) -> Self {
         Self {
             rpc,
             auth,
             hid,
+            peer_connection,
+            supports_check_mount_url,
             events,
             range_server: None,
             stale_controller_mount: false,
         }
     }
 
-    pub fn rebind(&mut self, rpc: RpcClient, hid: HidClient, auth: AuthenticatedClient) {
+    pub fn rebind(
+        &mut self,
+        rpc: RpcClient,
+        hid: HidClient,
+        peer_connection: Arc<RTCPeerConnection>,
+        auth: AuthenticatedClient,
+        supports_check_mount_url: bool,
+    ) {
         self.rpc.cancel_generation();
         self.rpc = rpc;
         self.hid = hid;
+        self.peer_connection = peer_connection;
         self.auth = auth;
+        self.supports_check_mount_url = supports_check_mount_url;
     }
 
     pub fn has_stale_controller_mount(&self) -> bool {
@@ -92,7 +113,7 @@ impl VirtualMediaManager {
             .is_some_and(|url| {
                 self.range_server
                     .as_ref()
-                    .is_none_or(|server| server.mount_url() != url)
+                    .is_none_or(|server| server.mount_url() != url || !server.is_healthy())
             });
         if self.stale_controller_mount {
             let _ = self.events.send(MediaEvent::StaleControllerMount {
@@ -103,6 +124,9 @@ impl VirtualMediaManager {
     }
 
     pub async fn check_url(&self, url: &str) -> Result<MountUrlInfo> {
+        if !self.supports_check_mount_url {
+            bail!("check_mount_url is unsupported by this JetKVM firmware");
+        }
         validate_http_url(url)?;
         self.rpc.check_mount_url(url).await
     }
@@ -116,10 +140,15 @@ impl VirtualMediaManager {
         approval.require("mount a remote URL")?;
         validate_http_url(url)?;
         self.ensure_unmounted().await?;
-        let checked = self.rpc.check_mount_url(url).await?;
-        if !checked.usable {
-            bail!("mount URL is unusable: {}", checked.reason);
-        }
+        let expected_size = if self.supports_check_mount_url {
+            let checked = self.rpc.check_mount_url(url).await?;
+            if !checked.usable {
+                bail!("mount URL is unusable: {}", checked.reason);
+            }
+            Some(checked.size)
+        } else {
+            None
+        };
         self.with_hid_recovery(self.rpc.mount_http(url, mode))
             .await?;
         let state = self
@@ -127,7 +156,7 @@ impl VirtualMediaManager {
                 state.source == "HTTP"
                     && state.mode == mode
                     && state.url.as_deref() == Some(url)
-                    && state.size == checked.size
+                    && expected_size.is_none_or(|size| state.size == size)
             })
             .await
             .context("JetKVM did not report the requested URL mount")?;
@@ -146,18 +175,25 @@ impl VirtualMediaManager {
             bail!("a controller-hosted image is already active");
         }
         let server = RangeServer::start(image, self.auth.base_url()).await?;
+        server.ensure_healthy()?;
         let url = server.mount_url().to_owned();
-        let checked = match self.rpc.check_mount_url(&url).await {
-            Ok(checked) if checked.usable => checked,
-            Ok(checked) => {
-                server.shutdown().await?;
-                bail!("JetKVM cannot read the local image: {}", checked.reason);
-            }
-            Err(error) => {
-                server.shutdown().await?;
-                return Err(error).context("failed to validate controller-hosted image");
-            }
+        let expected_size = if self.supports_check_mount_url {
+            let checked = match self.rpc.check_mount_url(&url).await {
+                Ok(checked) if checked.usable => checked,
+                Ok(checked) => {
+                    server.shutdown().await?;
+                    bail!("JetKVM cannot read the local image: {}", checked.reason);
+                }
+                Err(error) => {
+                    server.shutdown().await?;
+                    return Err(error).context("failed to validate controller-hosted image");
+                }
+            };
+            Some(checked.size)
+        } else {
+            None
         };
+        server.ensure_healthy()?;
         if let Err(error) = self
             .with_hid_recovery(self.rpc.mount_http(&url, mode))
             .await
@@ -170,7 +206,7 @@ impl VirtualMediaManager {
                 state.source == "HTTP"
                     && state.mode == mode
                     && state.url.as_deref() == Some(url.as_str())
-                    && state.size == checked.size
+                    && expected_size.is_none_or(|size| state.size == size)
             })
             .await
         {
@@ -181,6 +217,7 @@ impl VirtualMediaManager {
                 return Err(error).context("JetKVM did not report the controller-hosted mount");
             }
         };
+        server.ensure_healthy()?;
         self.range_server = Some(server);
         self.stale_controller_mount = false;
         Ok(redact_state(state))
@@ -228,51 +265,45 @@ impl VirtualMediaManager {
         if size > space.bytes_free {
             bail!("image is larger than available JetKVM storage");
         }
+
         let upload = self.rpc.start_upload(filename, size).await?;
-        if upload.already_uploaded_bytes > size {
-            bail!("JetKVM reported an invalid upload resume offset");
+        validate_upload_offset(upload.already_uploaded_bytes, size)?;
+        let http_result = upload_over_http(
+            &self.auth,
+            &upload.upload_id,
+            UploadTransfer {
+                path: &canonical,
+                filename,
+                total: size,
+                uploaded: upload.already_uploaded_bytes,
+                events: &self.events,
+                cancellation: &cancellation,
+            },
+        )
+        .await;
+        if http_result.is_err() {
+            if cancellation.is_cancelled() {
+                bail!("upload cancelled");
+            }
+            warn!("direct HTTP storage upload failed; falling back to WebRTC");
+            let upload = self.rpc.start_upload(filename, size).await?;
+            validate_upload_offset(upload.already_uploaded_bytes, size)?;
+            upload_over_data_channel(
+                &self.peer_connection,
+                &upload.upload_id,
+                UploadTransfer {
+                    path: &canonical,
+                    filename,
+                    total: size,
+                    uploaded: upload.already_uploaded_bytes,
+                    events: &self.events,
+                    cancellation: &cancellation,
+                },
+            )
+            .await?;
         }
 
-        let mut file = tokio::fs::File::open(&canonical)
-            .await
-            .context("failed to open upload image")?;
-        file.seek(std::io::SeekFrom::Start(upload.already_uploaded_bytes))
-            .await
-            .context("failed to seek upload image")?;
-        let events = self.events.clone();
-        let filename_owned = filename.to_owned();
-        let stream = upload_stream(
-            file,
-            upload.already_uploaded_bytes,
-            size,
-            filename_owned,
-            events,
-        );
-        let upload_url = format!(
-            "{}/storage/upload?uploadId={}",
-            self.auth.base_url(),
-            upload.upload_id
-        );
-        let request = self
-            .auth
-            .client()
-            .post(upload_url)
-            .body(Body::wrap_stream(stream))
-            .timeout(upload_timeout(size - upload.already_uploaded_bytes))
-            .send();
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => bail!("upload cancelled"),
-            response = request => response.context("storage upload request failed")?,
-        };
-        if !response.status().is_success() {
-            bail!("storage upload failed (HTTP {})", response.status());
-        }
-
-        let files = self.rpc.storage_files().await?.files;
-        files
-            .into_iter()
-            .find(|file| file.filename == filename && file.size == size)
-            .context("uploaded file was not reported with the expected name and size")
+        wait_for_storage_file(&self.rpc, filename, size, &cancellation).await
     }
 
     pub async fn mount_storage(
@@ -386,6 +417,7 @@ impl VirtualMediaManager {
 
 fn upload_timeout(remaining_bytes: u64) -> Duration {
     const ASSUMED_BYTES_PER_SECOND: u64 = 256 * 1024;
+
     const MINIMUM_SECONDS: u64 = 60;
     const MAXIMUM_SECONDS: u64 = 2 * 60 * 60;
 
@@ -395,6 +427,203 @@ fn upload_timeout(remaining_bytes: u64) -> Duration {
             .saturating_add(transfer_seconds)
             .min(MAXIMUM_SECONDS),
     )
+}
+fn validate_upload_offset(uploaded: u64, total: u64) -> Result<()> {
+    if uploaded > total {
+        bail!("JetKVM reported an invalid upload resume offset");
+    }
+    Ok(())
+}
+
+struct UploadTransfer<'a> {
+    path: &'a Path,
+    filename: &'a str,
+    total: u64,
+    uploaded: u64,
+    events: &'a broadcast::Sender<MediaEvent>,
+    cancellation: &'a CancellationToken,
+}
+
+async fn upload_over_http(
+    auth: &AuthenticatedClient,
+    upload_id: &str,
+    transfer: UploadTransfer<'_>,
+) -> Result<()> {
+    let UploadTransfer {
+        path,
+        filename,
+        total,
+        uploaded,
+        events,
+        cancellation,
+    } = transfer;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .context("failed to open upload image")?;
+    file.seek(std::io::SeekFrom::Start(uploaded))
+        .await
+        .context("failed to seek upload image")?;
+    let stream = upload_stream(file, uploaded, total, filename.to_owned(), events.clone());
+    let upload_url = format!("{}/storage/upload?uploadId={upload_id}", auth.base_url());
+    let request = auth
+        .client()
+        .post(upload_url)
+        .body(Body::wrap_stream(stream))
+        .timeout(upload_timeout(total - uploaded))
+        .send();
+    let response = tokio::select! {
+        _ = cancellation.cancelled() => bail!("upload cancelled"),
+        response = request => response.context("storage upload request failed")?,
+    };
+    if !response.status().is_success() {
+        bail!("storage upload failed (HTTP {})", response.status());
+    }
+    Ok(())
+}
+
+async fn upload_over_data_channel(
+    peer_connection: &Arc<RTCPeerConnection>,
+    upload_id: &str,
+    transfer: UploadTransfer<'_>,
+) -> Result<()> {
+    let UploadTransfer {
+        path,
+        filename,
+        total,
+        uploaded,
+        events,
+        cancellation,
+    } = transfer;
+    let channel = peer_connection
+        .create_data_channel(upload_id, None)
+        .await
+        .context("failed to create WebRTC upload channel")?;
+    channel
+        .set_buffered_amount_low_threshold(DATA_CHANNEL_BUFFER_LOW)
+        .await;
+
+    let buffer_low = Arc::new(Notify::new());
+    let buffer_low_callback = Arc::clone(&buffer_low);
+    channel
+        .on_buffered_amount_low(Box::new(move || {
+            let buffer_low = Arc::clone(&buffer_low_callback);
+            Box::pin(async move {
+                buffer_low.notify_one();
+            })
+        }))
+        .await;
+    let closed = Arc::new(Notify::new());
+    let closed_callback = Arc::clone(&closed);
+    channel.on_close(Box::new(move || {
+        let closed = Arc::clone(&closed_callback);
+        Box::pin(async move {
+            closed.notify_one();
+        })
+    }));
+
+    if let Err(error) =
+        crate::session::wait_data_channel_open(&channel, Duration::from_secs(15), cancellation)
+            .await
+    {
+        let _ = channel.close().await;
+        if cancellation.is_cancelled() {
+            bail!("upload cancelled");
+        }
+        return Err(error).context("failed to open WebRTC upload channel");
+    }
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .context("failed to open upload image")?;
+    file.seek(std::io::SeekFrom::Start(uploaded))
+        .await
+        .context("failed to seek upload image")?;
+    let mut sent = uploaded;
+    let mut last_progress = Instant::now() - PROGRESS_INTERVAL;
+    while sent < total {
+        while channel.buffered_amount().await > DATA_CHANNEL_BUFFER_HIGH {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    let _ = channel.close().await;
+                    bail!("upload cancelled");
+                }
+                _ = buffer_low.notified() => {}
+                _ = closed.notified() => {
+                    bail!("WebRTC upload channel closed before upload completed");
+                }
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    bail!("WebRTC upload channel backpressure timed out");
+                }
+            }
+        }
+        if channel.ready_state() != RTCDataChannelState::Open {
+            bail!("WebRTC upload channel closed before upload completed");
+        }
+        let length = usize::try_from((total - sent).min(UPLOAD_CHUNK_SIZE as u64))
+            .expect("bounded upload chunk fits usize");
+        let mut buffer = vec![0_u8; length];
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                let _ = channel.close().await;
+                bail!("upload cancelled");
+            }
+            result = file.read_exact(&mut buffer) => {
+                result.context("failed to read upload image")?;
+            }
+        }
+        channel
+            .send(&Bytes::from(buffer))
+            .await
+            .context("failed to send WebRTC upload data")?;
+        sent += length as u64;
+        if last_progress.elapsed() >= PROGRESS_INTERVAL || sent == total {
+            let _ = events.send(MediaEvent::UploadProgress {
+                filename: filename.to_owned(),
+                uploaded_bytes: sent,
+                total_bytes: total,
+            });
+            last_progress = Instant::now();
+        }
+    }
+
+    tokio::time::timeout(upload_timeout(total - uploaded), async {
+        loop {
+            if channel.ready_state() == RTCDataChannelState::Closed {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    let _ = channel.close().await;
+                    bail!("upload cancelled");
+                }
+                _ = closed.notified() => {}
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for WebRTC upload completion")?
+}
+
+async fn wait_for_storage_file(
+    rpc: &RpcClient,
+    filename: &str,
+    size: u64,
+    cancellation: &CancellationToken,
+) -> Result<StorageFile> {
+    for _ in 0..120 {
+        let files = rpc.storage_files().await?.files;
+        if let Some(file) = files
+            .into_iter()
+            .find(|file| file.filename == filename && file.size == size)
+        {
+            return Ok(file);
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => bail!("upload cancelled"),
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+    }
+    bail!("uploaded file was not reported with the expected name and size")
 }
 
 fn upload_stream(
