@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use webrtc::api::APIBuilder;
@@ -73,9 +73,18 @@ pub(crate) struct SessionConnection {
     hid: HidClient,
     signaling: EstablishedSignaling,
     device_version: Option<String>,
-    state_rx: mpsc::Receiver<RTCPeerConnectionState>,
+    state_rx: watch::Receiver<RTCPeerConnectionState>,
     cancellation: CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+pub(crate) fn is_terminal_state(state: RTCPeerConnectionState) -> bool {
+    matches!(
+        state,
+        RTCPeerConnectionState::Failed
+            | RTCPeerConnectionState::Disconnected
+            | RTCPeerConnectionState::Closed
+    )
 }
 
 struct ConnectionSetupGuard {
@@ -114,6 +123,9 @@ impl SessionConnection {
         keyframe_tx: mpsc::Sender<()>,
         mut keyframe_rx: mpsc::Receiver<()>,
     ) -> Result<Self> {
+        if pli_interval.is_zero() {
+            anyhow::bail!("pli_interval must be non-zero");
+        }
         let mut media_engine = MediaEngine::default();
         register_h264_codecs(&mut media_engine)?;
         let mut registry = Registry::new();
@@ -171,12 +183,10 @@ impl SessionConnection {
             Arc::clone(&unreliable_ordered),
             Arc::clone(&unreliable_unordered),
         );
-        let (state_tx, mut state_rx) = mpsc::channel(16);
+        let (state_tx, mut state_rx) = watch::channel(RTCPeerConnectionState::New);
         peer_connection.on_peer_connection_state_change(Box::new(move |state| {
-            let state_tx = state_tx.clone();
-            Box::pin(async move {
-                let _ = state_tx.send(state).await;
-            })
+            let _ = state_tx.send(state);
+            Box::pin(async {})
         }));
 
         let (rtp_tx, rtp_rx) = mpsc::channel::<Packet>(1024);
@@ -246,19 +256,25 @@ impl SessionConnection {
             h264::depacketize(rtp_rx, nal_tx).await;
         });
         let device_version = signaling.device_version.clone();
-        peer_connection.set_remote_description(answer).await?;
+        signaling
+            .set_remote_description(&peer_connection, answer)
+            .await?;
         info!(?generation, ?device_version, mode = ?signaling.mode, "WebRTC session established");
 
         tokio::time::timeout(CONNECTION_TIMEOUT, async {
             loop {
-                match state_rx.recv().await {
-                    Some(RTCPeerConnectionState::Connected) => return Ok::<_, anyhow::Error>(()),
-                    Some(RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) => {
+                let state = *state_rx.borrow();
+                match state {
+                    RTCPeerConnectionState::Connected => return Ok::<_, anyhow::Error>(()),
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                         anyhow::bail!("WebRTC connection failed during setup")
                     }
-                    Some(state) => debug!(?state, "peer connection state during setup"),
-                    None => anyhow::bail!("peer connection state channel closed"),
+                    state => debug!(?state, "peer connection state during setup"),
                 }
+                state_rx
+                    .changed()
+                    .await
+                    .context("peer connection state channel closed")?;
             }
         })
         .await
@@ -321,18 +337,11 @@ impl SessionConnection {
         self.cancellation.clone()
     }
 
-    pub async fn wait_for_end(&mut self) -> RTCPeerConnectionState {
-        loop {
-            match self.state_rx.recv().await {
-                Some(
-                    state @ (RTCPeerConnectionState::Failed
-                    | RTCPeerConnectionState::Disconnected
-                    | RTCPeerConnectionState::Closed),
-                ) => return state,
-                Some(state) => debug!(?state, "peer connection state"),
-                None => return RTCPeerConnectionState::Closed,
-            }
-        }
+    /// Returns a cloneable watch receiver for peer connection state.
+    /// The latest value is always available; use `is_terminal_state` to
+    /// detect session end.
+    pub fn end_watch(&self) -> watch::Receiver<RTCPeerConnectionState> {
+        self.state_rx.clone()
     }
 
     pub async fn shutdown(mut self) -> Result<()> {

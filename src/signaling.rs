@@ -6,7 +6,7 @@ use base64::prelude::*;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -30,6 +30,7 @@ pub struct EstablishedSignaling {
     pub mode: SignalingMode,
     pub device_version: Option<String>,
     task: Option<tokio::task::JoinHandle<()>>,
+    remote_candidates: Arc<RemoteIceCandidates>,
 }
 
 impl EstablishedSignaling {
@@ -39,6 +40,16 @@ impl EstablishedSignaling {
             let _ = task.await;
         }
     }
+
+    pub async fn set_remote_description(
+        &self,
+        peer_connection: &RTCPeerConnection,
+        answer: RTCSessionDescription,
+    ) -> Result<()> {
+        self.remote_candidates
+            .set_remote_description(peer_connection, answer)
+            .await
+    }
 }
 
 impl Drop for EstablishedSignaling {
@@ -46,6 +57,65 @@ impl Drop for EstablishedSignaling {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+#[derive(Default)]
+struct RemoteIceCandidates {
+    state: Mutex<RemoteIceState>,
+}
+
+#[derive(Default)]
+struct RemoteIceState {
+    remote_description_set: bool,
+    buffered: Vec<RTCIceCandidateInit>,
+}
+
+impl RemoteIceCandidates {
+    async fn add_candidate(
+        &self,
+        peer_connection: &RTCPeerConnection,
+        candidate: RTCIceCandidateInit,
+    ) -> Result<()> {
+        if candidate.candidate.is_empty() {
+            return Ok(());
+        }
+
+        let mut state = self.state.lock().await;
+        if state.remote_description_set {
+            peer_connection
+                .add_ice_candidate(candidate)
+                .await
+                .context("failed to add remote ICE candidate")?;
+        } else {
+            state.buffered.push(candidate);
+        }
+        Ok(())
+    }
+
+    async fn set_remote_description(
+        &self,
+        peer_connection: &RTCPeerConnection,
+        answer: RTCSessionDescription,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        peer_connection
+            .set_remote_description(answer)
+            .await
+            .context("failed to set remote SDP answer")?;
+        state.remote_description_set = true;
+        for candidate in std::mem::take(&mut state.buffered) {
+            peer_connection
+                .add_ice_candidate(candidate)
+                .await
+                .context("failed to add buffered remote ICE candidate")?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn buffered_count(&self) -> usize {
+        self.state.lock().await.buffered.len()
     }
 }
 
@@ -122,6 +192,7 @@ pub async fn establish(
                     mode: SignalingMode::LegacyHttp,
                     device_version: None,
                     task: None,
+                    remote_candidates: Arc::new(RemoteIceCandidates::default()),
                 },
             ))
         }
@@ -134,7 +205,10 @@ async fn establish_websocket(
     offer: &RTCSessionDescription,
     mut local_candidates: mpsc::Receiver<RTCIceCandidateInit>,
 ) -> Result<(RTCSessionDescription, EstablishedSignaling)> {
-    let (mut socket, device_version) = open_websocket(auth).await?;
+    let (mut socket, device_version) =
+        tokio::time::timeout(SIGNALING_TIMEOUT, open_websocket(auth))
+            .await
+            .context("WebSocket signaling connection timed out")??;
     let encoded_offer = encode_sdp(offer)?;
     let message = SignalMessage {
         kind: "offer".to_owned(),
@@ -145,6 +219,7 @@ async fn establish_websocket(
         .await
         .context("failed to send WebSocket SDP offer")?;
 
+    let remote_candidates = Arc::new(RemoteIceCandidates::default());
     let answer = tokio::time::timeout(SIGNALING_TIMEOUT, async {
         loop {
             tokio::select! {
@@ -157,7 +232,9 @@ async fn establish_websocket(
                     let message = incoming
                         .context("WebSocket signaling ended before SDP answer")?
                         .context("failed to read WebSocket signaling message")?;
-                    if let Some(answer) = process_signal(message, &peer_connection).await? {
+                    if let Some(answer) =
+                        process_signal(message, &peer_connection, &remote_candidates).await?
+                    {
                         break Ok::<_, anyhow::Error>(answer);
                     }
                 }
@@ -168,6 +245,7 @@ async fn establish_websocket(
     .context("WebSocket signaling timed out")??;
 
     let task_peer = Arc::clone(&peer_connection);
+    let task_candidates = Arc::clone(&remote_candidates);
     let task = tokio::spawn(async move {
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
@@ -189,7 +267,7 @@ async fn establish_websocket(
                     let Some(Ok(message)) = incoming else {
                         return;
                     };
-                    if process_signal(message, &task_peer).await.is_err() {
+                    if process_signal(message, &task_peer, &task_candidates).await.is_err() {
                         return;
                     }
                 }
@@ -202,6 +280,7 @@ async fn establish_websocket(
             mode: SignalingMode::WebSocket,
             device_version,
             task: Some(task),
+            remote_candidates,
         },
     ))
 }
@@ -300,6 +379,7 @@ where
 async fn process_signal(
     message: Message,
     peer_connection: &Arc<RTCPeerConnection>,
+    remote_candidates: &RemoteIceCandidates,
 ) -> Result<Option<RTCSessionDescription>> {
     let Message::Text(text) = message else {
         return Ok(None);
@@ -320,12 +400,9 @@ async fn process_signal(
         "new-ice-candidate" => {
             let candidate: RTCIceCandidateInit =
                 serde_json::from_value(signal.data).context("invalid remote ICE candidate")?;
-            if !candidate.candidate.is_empty() {
-                peer_connection
-                    .add_ice_candidate(candidate)
-                    .await
-                    .context("failed to add remote ICE candidate")?;
-            }
+            remote_candidates
+                .add_candidate(peer_connection, candidate)
+                .await?;
             Ok(None)
         }
         _ => Ok(None),
@@ -357,4 +434,92 @@ pub async fn exchange_sdp(
         .await
         .context("failed to parse signaling response")?;
     decode_sdp(&session_resp.sd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn buffers_trickled_candidates_until_remote_description_is_set() {
+        let api = webrtc::api::APIBuilder::new().build();
+        let offer_peer = Arc::new(
+            api.new_peer_connection(
+                webrtc::peer_connection::configuration::RTCConfiguration::default(),
+            )
+            .await
+            .expect("offer peer connection"),
+        );
+        let answer_peer = Arc::new(
+            api.new_peer_connection(
+                webrtc::peer_connection::configuration::RTCConfiguration::default(),
+            )
+            .await
+            .expect("answer peer connection"),
+        );
+        offer_peer
+            .create_data_channel("rpc", None)
+            .await
+            .expect("offer data channel");
+        let offer = offer_peer.create_offer(None).await.expect("SDP offer");
+        offer_peer
+            .set_local_description(offer.clone())
+            .await
+            .expect("offer local description");
+        answer_peer
+            .set_remote_description(offer)
+            .await
+            .expect("answer remote description");
+
+        let (candidate_tx, mut candidate_rx) = mpsc::channel(1);
+        answer_peer.on_ice_candidate(Box::new(move |candidate| {
+            let candidate_tx = candidate_tx.clone();
+            Box::pin(async move {
+                if let Some(candidate) = candidate
+                    && let Ok(candidate) = candidate.to_json()
+                {
+                    let _ = candidate_tx.send(candidate).await;
+                }
+            })
+        }));
+        let answer = answer_peer.create_answer(None).await.expect("SDP answer");
+        answer_peer
+            .set_local_description(answer.clone())
+            .await
+            .expect("answer local description");
+        let candidate = tokio::time::timeout(Duration::from_secs(2), candidate_rx.recv())
+            .await
+            .expect("answer should gather an ICE candidate")
+            .expect("candidate sender should stay alive");
+
+        let remote_candidates = Arc::new(RemoteIceCandidates::default());
+        let message = SignalMessage {
+            kind: "new-ice-candidate".to_owned(),
+            data: serde_json::to_value(candidate).expect("candidate should serialize"),
+        };
+        assert!(
+            process_signal(
+                Message::Text(
+                    serde_json::to_string(&message)
+                        .expect("signal should serialize")
+                        .into(),
+                ),
+                &offer_peer,
+                &remote_candidates,
+            )
+            .await
+            .expect("candidate should be buffered")
+            .is_none()
+        );
+        assert_eq!(remote_candidates.buffered_count().await, 1);
+
+        remote_candidates
+            .set_remote_description(&offer_peer, answer)
+            .await
+            .expect("buffered candidate should apply after the answer");
+        assert_eq!(remote_candidates.buffered_count().await, 0);
+
+        offer_peer.close().await.expect("offer peer should close");
+        answer_peer.close().await.expect("answer peer should close");
+    }
 }

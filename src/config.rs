@@ -126,6 +126,12 @@ impl Config {
         if matches!(self.command, Some(CliCommand::Serve { stdio: false })) {
             anyhow::bail!("serve currently requires --stdio");
         }
+        if self.pli_interval == 0 {
+            anyhow::bail!("--pli-interval must be at least 1 second");
+        }
+        if self.screenshot && self.command.is_some() {
+            anyhow::bail!("--screenshot cannot be combined with the serve subcommand");
+        }
         Ok(())
     }
 }
@@ -251,6 +257,39 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("--stdio")
+        );
+    }
+
+    #[test]
+    fn zero_pli_interval_is_rejected() {
+        let config = Config::try_parse_from([
+            "recorder-for-jetkvm",
+            "--host",
+            "192.168.1.130",
+            "--pli-interval",
+            "0",
+        ])
+        .expect("arguments should parse");
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "--pli-interval must be at least 1 second"
+        );
+    }
+
+    #[test]
+    fn screenshot_mode_conflicts_with_serve() {
+        let config = Config::try_parse_from([
+            "recorder-for-jetkvm",
+            "--host",
+            "192.168.1.130",
+            "--screenshot",
+            "serve",
+            "--stdio",
+        ])
+        .expect("arguments should parse");
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "--screenshot cannot be combined with the serve subcommand"
         );
     }
 

@@ -6,15 +6,22 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use rand::RngCore;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const RESPONSE_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_READS: usize = 8;
+/// A client has this long to finish its HTTP request headers before its connection slot is released.
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+/// A response write may be idle this long; every successful partial write resets the deadline.
+const RESPONSE_WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const BUSY_RESPONSE: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const ROUTE_PREFIX: &str = "/jetkvm-controller/media/";
 pub const REDACTED_LOCAL_MEDIA_URL: &str = "controller://local-image";
 
@@ -41,6 +48,21 @@ impl RangeServer {
     }
 
     async fn start_on(file_path: &Path, bind_address: IpAddr) -> Result<Self> {
+        Self::start_on_with_timeouts(
+            file_path,
+            bind_address,
+            REQUEST_HEADER_TIMEOUT,
+            RESPONSE_WRITE_IDLE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn start_on_with_timeouts(
+        file_path: &Path,
+        bind_address: IpAddr,
+        request_header_timeout: Duration,
+        response_write_idle_timeout: Duration,
+    ) -> Result<Self> {
         let canonical = tokio::fs::canonicalize(file_path).await.with_context(|| {
             format!(
                 "failed to canonicalize media image: {}",
@@ -89,22 +111,22 @@ impl RangeServer {
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.context("range server accept failed")?;
                         let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
-                            connections.spawn(async move {
-                                let mut stream = stream;
-                                let _ = write_simple_response(
-                                    &mut stream,
-                                    503,
-                                    "Service Unavailable",
-                                    &[],
-                                ).await;
-                            });
+                            let _ = stream.try_write(BUSY_RESPONSE);
                             continue;
                         };
                         let file = Arc::clone(&file);
                         let route = route.clone();
                         connections.spawn(async move {
                             let _permit = permit;
-                            let _ = handle_connection(stream, file, file_size, &route).await;
+                            let _ = handle_connection(
+                                stream,
+                                file,
+                                file_size,
+                                &route,
+                                request_header_timeout,
+                                response_write_idle_timeout,
+                            )
+                            .await;
                         });
                     }
                     completed = connections.join_next(), if !connections.is_empty() => {
@@ -188,13 +210,26 @@ async fn select_reachable_address(jetkvm_base_url: &str) -> Result<IpAddr> {
     Ok(socket.local_addr()?.ip())
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
+async fn handle_connection<S>(
+    mut stream: S,
     file: Arc<std::fs::File>,
     file_size: u64,
     expected_route: &str,
-) -> Result<()> {
-    let Some(request) = read_request(&mut stream).await? else {
+    request_header_timeout: Duration,
+    response_write_idle_timeout: Duration,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(request) = (match timeout(
+        request_header_timeout,
+        read_request(&mut stream, response_write_idle_timeout),
+    )
+    .await
+    {
+        Ok(request) => request?,
+        Err(_) => return Ok(()),
+    }) else {
         return Ok(());
     };
     let mut lines = request.split("\r\n");
@@ -204,10 +239,24 @@ async fn handle_connection(
     let route = parts.next().unwrap_or_default();
     let version = parts.next().unwrap_or_default();
     if parts.next().is_some() || version != "HTTP/1.1" {
-        return write_simple_response(&mut stream, 400, "Bad Request", &[]).await;
+        return write_simple_response(
+            &mut stream,
+            400,
+            "Bad Request",
+            &[],
+            response_write_idle_timeout,
+        )
+        .await;
     }
     if route != expected_route {
-        return write_simple_response(&mut stream, 404, "Not Found", &[]).await;
+        return write_simple_response(
+            &mut stream,
+            404,
+            "Not Found",
+            &[],
+            response_write_idle_timeout,
+        )
+        .await;
     }
     if method != "GET" && method != "HEAD" {
         return write_simple_response(
@@ -215,6 +264,7 @@ async fn handle_connection(
             405,
             "Method Not Allowed",
             &[("Allow", "GET, HEAD".to_owned())],
+            response_write_idle_timeout,
         )
         .await;
     }
@@ -225,11 +275,25 @@ async fn handle_connection(
             break;
         }
         let Some((name, value)) = line.split_once(':') else {
-            return write_simple_response(&mut stream, 400, "Bad Request", &[]).await;
+            return write_simple_response(
+                &mut stream,
+                400,
+                "Bad Request",
+                &[],
+                response_write_idle_timeout,
+            )
+            .await;
         };
         if name.eq_ignore_ascii_case("range") {
             if range_header.is_some() {
-                return write_simple_response(&mut stream, 400, "Bad Request", &[]).await;
+                return write_simple_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    &[],
+                    response_write_idle_timeout,
+                )
+                .await;
             }
             range_header = Some(value.trim());
         }
@@ -239,7 +303,14 @@ async fn handle_connection(
         Some(value) => match parse_range(value, file_size) {
             Ok(range) => Some(range),
             Err(RangeError::Malformed) => {
-                return write_simple_response(&mut stream, 400, "Bad Request", &[]).await;
+                return write_simple_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    &[],
+                    response_write_idle_timeout,
+                )
+                .await;
             }
             Err(RangeError::Unsatisfiable) => {
                 return write_simple_response(
@@ -247,6 +318,7 @@ async fn handle_connection(
                     416,
                     "Range Not Satisfiable",
                     &[("Content-Range", format!("bytes */{file_size}"))],
+                    response_write_idle_timeout,
                 )
                 .await;
             }
@@ -267,7 +339,14 @@ async fn handle_connection(
     if status == 206 {
         headers.push(("Content-Range", format!("bytes {start}-{end}/{file_size}")));
     }
-    write_headers(&mut stream, status, reason, &headers).await?;
+    write_headers(
+        &mut stream,
+        status,
+        reason,
+        &headers,
+        response_write_idle_timeout,
+    )
+    .await?;
     if method == "HEAD" {
         return Ok(());
     }
@@ -291,15 +370,23 @@ async fn handle_connection(
         if count == 0 {
             bail!("media image ended during range response");
         }
-        stream.write_all(&buffer[..count]).await?;
+        write_with_idle_timeout(&mut stream, &buffer[..count], response_write_idle_timeout).await?;
         offset += count as u64;
         remaining -= count as u64;
     }
-    stream.shutdown().await?;
+    timeout(response_write_idle_timeout, stream.shutdown())
+        .await
+        .context("range response shutdown timed out")??;
     Ok(())
 }
 
-async fn read_request(stream: &mut TcpStream) -> Result<Option<String>> {
+async fn read_request<S>(
+    stream: &mut S,
+    response_write_idle_timeout: Duration,
+) -> Result<Option<String>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut request = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
     loop {
@@ -309,7 +396,14 @@ async fn read_request(stream: &mut TcpStream) -> Result<Option<String>> {
         }
         request.extend_from_slice(&chunk[..count]);
         if request.len() > MAX_REQUEST_BYTES {
-            write_simple_response(stream, 431, "Request Header Fields Too Large", &[]).await?;
+            write_simple_response(
+                stream,
+                431,
+                "Request Header Fields Too Large",
+                &[],
+                response_write_idle_timeout,
+            )
+            .await?;
             return Ok(None);
         }
         if request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -359,24 +453,39 @@ fn parse_range(value: &str, size: u64) -> std::result::Result<(u64, u64), RangeE
     Ok((start, end.min(size - 1)))
 }
 
-async fn write_simple_response(
-    stream: &mut TcpStream,
+async fn write_simple_response<S>(
+    stream: &mut S,
     status: u16,
     reason: &str,
     headers: &[(&str, String)],
-) -> Result<()> {
+    response_write_idle_timeout: Duration,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let mut all_headers = headers.to_vec();
     all_headers.push(("Content-Length", "0".to_owned()));
     all_headers.push(("Connection", "close".to_owned()));
-    write_headers(stream, status, reason, &all_headers).await
+    write_headers(
+        stream,
+        status,
+        reason,
+        &all_headers,
+        response_write_idle_timeout,
+    )
+    .await
 }
 
-async fn write_headers(
-    stream: &mut TcpStream,
+async fn write_headers<S>(
+    stream: &mut S,
     status: u16,
     reason: &str,
     headers: &[(&str, String)],
-) -> Result<()> {
+    response_write_idle_timeout: Duration,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let mut response = format!("HTTP/1.1 {status} {reason}\r\n");
     for (name, value) in headers {
         response.push_str(name);
@@ -385,7 +494,26 @@ async fn write_headers(
         response.push_str("\r\n");
     }
     response.push_str("\r\n");
-    stream.write_all(response.as_bytes()).await?;
+    write_with_idle_timeout(stream, response.as_bytes(), response_write_idle_timeout).await
+}
+
+async fn write_with_idle_timeout<S>(
+    stream: &mut S,
+    mut bytes: &[u8],
+    response_write_idle_timeout: Duration,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    while !bytes.is_empty() {
+        let count = timeout(response_write_idle_timeout, stream.write(bytes))
+            .await
+            .context("range response write timed out")??;
+        if count == 0 {
+            bail!("range response writer closed");
+        }
+        bytes = &bytes[count..];
+    }
     Ok(())
 }
 
@@ -393,6 +521,47 @@ async fn write_headers(
 mod tests {
     use super::*;
     use reqwest::header::RANGE;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::net::TcpStream;
+    use tokio::time::advance;
+
+    async fn start_test_server(
+        image: &[u8],
+        request_header_timeout: Duration,
+        response_write_idle_timeout: Duration,
+    ) -> (tempfile::TempDir, RangeServer) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("image.iso");
+        tokio::fs::write(&path, image).await.expect("fixture write");
+        let server = RangeServer::start_on_with_timeouts(
+            &path,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            request_header_timeout,
+            response_write_idle_timeout,
+        )
+        .await
+        .expect("range server should start");
+        (directory, server)
+    }
+
+    async fn request_response(server: &RangeServer) -> Vec<u8> {
+        let url = reqwest::Url::parse(server.mount_url()).expect("server URL");
+        let host = url.host_str().expect("server host");
+        let port = url.port().expect("server port");
+        let mut stream = TcpStream::connect((host, port))
+            .await
+            .expect("server connection");
+        stream
+            .write_all(format!("GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n", url.path()).as_bytes())
+            .await
+            .expect("request write");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("response read");
+        response
+    }
 
     #[test]
     fn parses_range_forms_and_errors() {
@@ -450,6 +619,177 @@ mod tests {
             404
         );
         server.shutdown().await.expect("range server shutdown");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_headers_disconnect_and_release_connection_capacity() {
+        let (_directory, server) =
+            start_test_server(b"image", Duration::from_secs(1), Duration::from_secs(1)).await;
+        let url = reqwest::Url::parse(server.mount_url()).expect("server URL");
+        let host = url.host_str().expect("server host");
+        let port = url.port().expect("server port");
+        let mut stalled = TcpStream::connect((host, port))
+            .await
+            .expect("stalled client connection");
+        stalled
+            .write_all(b"GET ")
+            .await
+            .expect("partial request write");
+
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let mut closed = [0_u8; 1];
+        assert_eq!(
+            stalled
+                .read(&mut closed)
+                .await
+                .expect("stalled client read"),
+            0,
+            "server did not disconnect incomplete request"
+        );
+        let response = request_response(&server).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "released capacity did not serve a valid request"
+        );
+        server.shutdown().await.expect("range server shutdown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eight_incomplete_headers_cannot_starve_valid_request() {
+        let (_directory, server) =
+            start_test_server(b"image", Duration::from_secs(1), Duration::from_secs(1)).await;
+        let url = reqwest::Url::parse(server.mount_url()).expect("server URL");
+        let host = url.host_str().expect("server host");
+        let port = url.port().expect("server port");
+        let mut stalled = Vec::new();
+        for _ in 0..MAX_CONCURRENT_READS {
+            let mut client = TcpStream::connect((host, port))
+                .await
+                .expect("stalled client connection");
+            client
+                .write_all(b"GET ")
+                .await
+                .expect("partial request write");
+            stalled.push(client);
+        }
+
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let response = request_response(&server).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+            "stalled requests retained all connection slots"
+        );
+        drop(stalled);
+        server.shutdown().await.expect("range server shutdown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_response_writer_releases_its_permit() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("image.iso");
+        tokio::fs::write(&path, vec![0_u8; RESPONSE_BUFFER_BYTES])
+            .await
+            .expect("fixture write");
+        let file = Arc::new(std::fs::File::open(path).expect("fixture file"));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .expect("initial permit");
+        let (mut client, server_stream) = duplex(256);
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            handle_connection(
+                server_stream,
+                file,
+                RESPONSE_BUFFER_BYTES as u64,
+                "/media",
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        client
+            .write_all(b"GET /media HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("request write");
+
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            task.await.expect("connection task join").is_err(),
+            "blocked response write unexpectedly completed"
+        );
+        assert!(
+            semaphore.try_acquire().is_ok(),
+            "stalled response writer retained its connection permit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_active_multichunk_response_completes() {
+        let image = vec![0x5a; RESPONSE_BUFFER_BYTES * 3];
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("image.iso");
+        tokio::fs::write(&path, &image)
+            .await
+            .expect("fixture write");
+        let file = Arc::new(std::fs::File::open(path).expect("fixture file"));
+        let (mut client, server_stream) = duplex(RESPONSE_BUFFER_BYTES);
+        let response_task = tokio::spawn(async move {
+            handle_connection(
+                server_stream,
+                file,
+                (RESPONSE_BUFFER_BYTES * 3) as u64,
+                "/media",
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        let reader_task = tokio::spawn(async move {
+            client
+                .write_all(b"GET /media HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await?;
+            let mut response = Vec::new();
+            let mut chunk = vec![0_u8; RESPONSE_BUFFER_BYTES / 2];
+            loop {
+                let count = client.read(&mut chunk).await?;
+                if count == 0 {
+                    return Ok::<_, std::io::Error>(response);
+                }
+                response.extend_from_slice(&chunk[..count]);
+                tokio::time::sleep(Duration::from_millis(900)).await;
+            }
+        });
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            advance(Duration::from_millis(900)).await;
+        }
+
+        assert!(
+            response_task.is_finished(),
+            "slow but active reader did not complete the response"
+        );
+        response_task
+            .await
+            .expect("response task join")
+            .expect("response should not time out");
+        let response = reader_task
+            .await
+            .expect("reader task join")
+            .expect("reader should not fail");
+        assert!(
+            response.ends_with(&image),
+            "response body was incomplete after multiple chunks"
+        );
     }
 
     #[tokio::test]

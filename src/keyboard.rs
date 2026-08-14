@@ -36,7 +36,11 @@ pub fn text_to_macro(text: &str) -> Result<Vec<MacroStep>> {
     }
 
     let mut steps = Vec::with_capacity(text.len().saturating_mul(2));
-    for character in text.chars() {
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' && characters.peek() == Some(&'\n') {
+            characters.next();
+        }
         let (modifier, usage) = us_ascii_usage(character).ok_or_else(|| {
             anyhow::anyhow!("character is unavailable in US keyboard layout: {character:?}")
         })?;
@@ -116,5 +120,22 @@ mod tests {
         assert_eq!(steps[1], MacroStep::release());
         assert_eq!(steps[2].modifier, 0);
         assert_eq!(steps[3], MacroStep::release());
+    }
+
+    #[test]
+    fn collapses_crlf_to_one_enter() {
+        let steps = text_to_macro("a\r\nb\r\n").expect("text should convert");
+        let enter_steps = steps.iter().filter(|step| step.keys[0] == 0x28).count();
+        assert_eq!(enter_steps, 2);
+        assert_eq!(
+            text_to_macro("\r")
+                .expect("carriage return should convert")
+                .len(),
+            2
+        );
+        assert_eq!(
+            text_to_macro("\n").expect("newline should convert").len(),
+            2
+        );
     }
 }

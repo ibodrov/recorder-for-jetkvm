@@ -80,15 +80,49 @@ async fn run_recording(config: &Config, controller: JetKvmController) -> Result<
     Ok(())
 }
 
-async fn run_screenshot(controller: JetKvmController, output_path: &Path) -> Result<()> {
-    let snapshot = tokio::select! {
-        result = controller.snapshot_to(output_path.to_owned(), Approval { approved: true }) => result?,
-        _ = tokio::signal::ctrl_c() => {
-            controller.shutdown().await?;
-            return Err(anyhow!("received shutdown signal before screenshot capture"));
+/// connect() returns as soon as the actor is running; the WebRTC session
+/// may still be establishing. Screenshot mode must wait for the first
+/// Connected state before snapshotting.
+async fn wait_for_connected(controller: &JetKvmController) -> Result<()> {
+    use recorder_for_jetkvm::controller::{ConnectionState, ControllerEvent};
+
+    if controller.status().await?.state == ConnectionState::Connected {
+        return Ok(());
+    }
+    let mut events = controller.subscribe_events();
+    tokio::time::timeout(Duration::from_secs(60), async move {
+        loop {
+            match events.recv().await {
+                Ok(ControllerEvent::ConnectionState {
+                    state: ConnectionState::Connected,
+                    ..
+                }) => return Ok(()),
+                Ok(_) => continue,
+                Err(_) => anyhow::bail!("controller event stream closed before connecting"),
+            }
         }
+    })
+    .await
+    .context("timed out waiting for the JetKVM connection")?
+}
+
+async fn run_screenshot(controller: JetKvmController, output_path: &Path) -> Result<()> {
+    if let Err(error) = wait_for_connected(&controller).await {
+        let _ = controller.shutdown().await;
+        return Err(error);
+    }
+    let snapshot_result = tokio::select! {
+        result = controller.snapshot_to(output_path.to_owned(), Approval { approved: true }, None) => result,
+        _ = tokio::signal::ctrl_c() => Err(anyhow!("received shutdown signal before screenshot capture")),
     };
-    controller.shutdown().await?;
+    // Shutting the controller down must happen on every path, including
+    // capture failures, so WebRTC and signaling cleanup complete.
+    let shutdown_result = controller.shutdown().await;
+    let snapshot = match (snapshot_result, shutdown_result) {
+        (Ok(snapshot), Ok(())) => snapshot,
+        (Err(capture), _) => return Err(capture),
+        (Ok(_), Err(shutdown)) => return Err(shutdown),
+    };
     info!(
         output = %output_path.display(),
         width = snapshot.width,

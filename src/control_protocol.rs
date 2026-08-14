@@ -2,26 +2,29 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::controller::{JetKvmController, ScrollEvent, TypeTextRequest};
+use crate::controller::{FrameCursor, JetKvmController, ScrollEvent, TypeTextRequest};
+use crate::error::{CodedError, codes, error_code};
 use crate::hid::{AbsoluteMouseEvent, RelativeMouseEvent};
 use crate::rpc::VirtualMediaMode;
 use crate::virtual_media::Approval;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const OUTPUT_BUFFER: usize = 128;
 
 const MAX_ACTIVE_REQUESTS: usize = 64;
+const DISPATCH_BUFFER: usize = 64;
 const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Deserialize)]
 struct Request {
     id: Value,
@@ -59,6 +62,9 @@ struct SnapshotParams {
     path: Option<PathBuf>,
     #[serde(default)]
     approved: bool,
+    /// When set, wait for a frame strictly newer than this cursor.
+    #[serde(default)]
+    after: Option<FrameCursor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +126,25 @@ enum ReadLine {
     Eof,
 }
 
+/// What the protocol layer needs to know about an admitted request: whether
+/// it is an upload (truthful cancellation target) or any other operation
+/// (not cancellable once admitted).
+#[derive(Clone)]
+enum ActiveKind {
+    Upload(CancellationToken),
+    Other,
+}
+
+type ActiveMap = Arc<Mutex<HashMap<String, ActiveKind>>>;
+
+/// A state-changing request queued for the ordered dispatcher.
+struct QueuedRequest {
+    id: Value,
+    method: String,
+    params: Value,
+    upload_cancellation: Option<CancellationToken>,
+}
+
 pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
     let (output_tx, mut output_rx) = mpsc::channel::<Value>(OUTPUT_BUFFER);
     let writer = tokio::spawn(async move {
@@ -135,12 +160,19 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
         Result::<()>::Ok(())
     });
 
+    // Controller events are suppressed until the hello handshake completes,
+    // so a client never observes an event before the handshake response.
+    let handshake_done = Arc::new(AtomicBool::new(false));
+    let event_handshake = Arc::clone(&handshake_done);
     let event_output = output_tx.clone();
     let mut events = controller.subscribe_events();
     let event_task = tokio::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(event) => {
+                    if !event_handshake.load(Ordering::Acquire) {
+                        continue;
+                    }
                     if let Ok(value) = serde_json::to_value(event)
                         && event_output.send(value).await.is_err()
                     {
@@ -165,9 +197,41 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
             }
         }
     });
-    let active = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
+
+    let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
     let server_shutdown = CancellationToken::new();
-    let mut requests = JoinSet::new();
+
+    // SIGINT/SIGTERM take the same shutdown path as protocol shutdown and
+    // stdin EOF: stop admitting work, cancel uploads, clean up the session.
+    {
+        let signal_shutdown = server_shutdown.clone();
+        tokio::spawn(async move {
+            wait_for_termination_signal().await;
+            signal_shutdown.cancel();
+        });
+    }
+
+    let (dispatch_tx, dispatch_rx) = mpsc::channel::<QueuedRequest>(DISPATCH_BUFFER);
+    let dispatcher = {
+        let dispatch_controller = controller.clone();
+        let dispatch_output = output_tx.clone();
+        let dispatch_active = Arc::clone(&active);
+        let dispatch_shutdown = server_shutdown.clone();
+        tokio::spawn(async move {
+            run_dispatcher(
+                dispatch_rx,
+                dispatch_output,
+                dispatch_active,
+                dispatch_shutdown,
+                move |method, params, upload_cancellation| {
+                    let controller = dispatch_controller.clone();
+                    async move { dispatch(&controller, &method, params, upload_cancellation).await }
+                },
+            )
+            .await;
+        })
+    };
+
     let mut handshake_complete = false;
 
     loop {
@@ -262,35 +326,61 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                                     "protocol_version": PROTOCOL_VERSION,
                                     "capabilities": capability_names(supports_check_mount_url),
                                     "warnings": warnings,
+                                    "status": status,
                                 }),
+                            ).await?;
+                            handshake_done.store(true, Ordering::Release);
+                            continue;
+                        }
+
+                        if request.method == "hello" {
+                            send_error(
+                                &output_tx,
+                                request.id,
+                                "invalid_params",
+                                "handshake is already complete".to_owned(),
                             ).await?;
                             continue;
                         }
 
+                        // Cancellation is truthful: uploads only, routed
+                        // inline so it stays responsive while the ordered
+                        // worker is busy.
                         if request.method == "cancel" {
-                            let result = serde_json::from_value::<CancelParams>(request.params);
-                            match result {
+                            match serde_json::from_value::<CancelParams>(request.params) {
                                 Ok(params) => {
                                     let key = request_key(&params.id);
-                                    let cancelled = active
-                                        .lock()
-                                        .await
-                                        .get(&key)
-                                        .is_some_and(|token| {
-                                            token.cancel();
-                                            true
-                                        });
-                                    send_success(
-                                        &output_tx,
-                                        request.id,
-                                        serde_json::json!({ "cancelled": cancelled }),
-                                    ).await?;
+                                    match cancel_active(&active, &key).await {
+                                        CancelOutcome::Cancelled => {
+                                            send_success(
+                                                &output_tx,
+                                                request.id,
+                                                serde_json::json!({ "cancelled": true }),
+                                            ).await?;
+                                        }
+                                        CancelOutcome::NoActiveRequest => {
+                                            send_error(
+                                                &output_tx,
+                                                request.id,
+                                                codes::INVALID_PARAMS,
+                                                "no active request with that id".to_owned(),
+                                            ).await?;
+                                        }
+                                        CancelOutcome::NotCancellable => {
+                                            send_error(
+                                                &output_tx,
+                                                request.id,
+                                                codes::NOT_CANCELLABLE,
+                                                "only upload requests may be cancelled".to_owned(),
+                                            ).await?;
+                                        }
+                                    }
                                 }
                                 Err(_) => {
                                     send_error(
                                         &output_tx,
                                         request.id,
-                                        "invalid_params",
+                                        codes::INVALID_PARAMS,
                                         "cancel requires a request id".to_owned(),
                                     ).await?;
                                 }
@@ -298,8 +388,28 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                             continue;
                         }
 
+                        // status stays concurrent: it is a read-only query
+                        // the controller answers promptly in every state, so
+                        // it cannot overtake or delay state-changing work.
+                        if request.method == "status" {
+                            match controller.status().await {
+                                Ok(status) => {
+                                    send_success(&output_tx, request.id, to_value(status)?).await?;
+                                }
+                                Err(error) => {
+                                    let error = public_error(&error);
+                                    send_error(&output_tx, request.id, error.code, error.message)
+                                        .await?;
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Everything else is state-changing and must execute
+                        // in NDJSON input order on the ordered dispatcher.
                         let key = request_key(&request.id);
-                        let cancellation = CancellationToken::new();
+                        let upload_cancellation =
+                            (request.method == "upload").then(CancellationToken::new);
                         let admission_error = {
                             let mut active = active.lock().await;
                             if active.contains_key(&key) {
@@ -309,11 +419,16 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                                 ))
                             } else if active.len() >= MAX_ACTIVE_REQUESTS {
                                 Some((
-                                    "server_busy",
+                                    codes::SERVER_BUSY,
                                     format!("at most {MAX_ACTIVE_REQUESTS} requests may be active"),
                                 ))
                             } else {
-                                active.insert(key.clone(), cancellation.clone());
+                                active.insert(
+                                    key.clone(),
+                                    upload_cancellation
+                                        .clone()
+                                        .map_or(ActiveKind::Other, ActiveKind::Upload),
+                                );
                                 None
                             }
                         };
@@ -321,80 +436,126 @@ pub async fn serve_stdio(controller: JetKvmController) -> Result<()> {
                             send_error(&output_tx, request.id, code, message).await?;
                             continue;
                         }
-                        let request_controller = controller.clone();
-                        let request_output = output_tx.clone();
-                        let request_active = Arc::clone(&active);
-                        let request_shutdown = server_shutdown.clone();
-                        requests.spawn(async move {
-                            let id = request.id.clone();
-                            let method = request.method;
-                            let dispatch_cancellation = cancellation.clone();
-                            let operation = async {
-                                if method == "shutdown" {
-                                    wait_for_prior_requests(&request_active, &key).await?;
-                                }
-                                dispatch(
-                                    &request_controller,
-                                    &method,
-                                    request.params,
-                                    dispatch_cancellation,
-                                )
-                                .await
-                            };
-                            let result = if method == "upload" {
-                                operation.await
-                            } else {
-                                tokio::select! {
-                                    result = operation => result,
-                                    _ = cancellation.cancelled() => {
-                                        Err(anyhow::anyhow!("request cancelled"))
-                                    }
-                                }
-                            };
-                            match result {
-                                Ok(value) => {
-                                    let _ = send_success(&request_output, id, value).await;
-                                    if method == "shutdown" {
-                                        request_shutdown.cancel();
-                                    }
-                                }
-                                Err(error) => {
-                                    let error = public_error(&error);
-                                    let _ = send_error(
-                                        &request_output,
-                                        id,
-                                        error.code,
-                                        error.message,
-                                    )
-                                    .await;
-                                }
-                            }
-                            request_active.lock().await.remove(&key);
-                        });
+                        dispatch_tx
+                            .send(QueuedRequest {
+                                id: request.id,
+                                method: request.method,
+                                params: request.params,
+                                upload_cancellation,
+                            })
+                            .await
+                            .context("ordered dispatcher stopped")?;
                     }
                 }
             }
         }
     }
 
-    for token in active.lock().await.values() {
-        token.cancel();
+    // Shutdown orchestration: stop admitting work, cancel active uploads
+    // before draining, then let the ordered worker finish.
+    {
+        let active = active.lock().await;
+        for kind in active.values() {
+            if let ActiveKind::Upload(token) = kind {
+                token.cancel();
+            }
+        }
     }
-    while requests.join_next().await.is_some() {}
-    if !server_shutdown.is_cancelled() {
-        controller.shutdown().await?;
+    drop(dispatch_tx);
+    let mut dispatcher = dispatcher;
+    if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, &mut dispatcher)
+        .await
+        .is_err()
+    {
+        dispatcher.abort();
     }
+    // Every exit path (protocol shutdown, EOF, SIGINT/SIGTERM) converges on
+    // the controller's idempotent shutdown; a cleanup failure exits nonzero.
+    controller.shutdown().await?;
     event_task.abort();
     drop(output_tx);
     writer.await.context("protocol writer task failed")??;
     Ok(())
 }
 
+/// Waits for Ctrl+C on every platform and SIGTERM on Unix.
+async fn wait_for_termination_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Runs queued state-changing requests strictly in input order; each result
+/// is awaited before the next request starts.
+async fn run_dispatcher<H, F>(
+    mut rx: mpsc::Receiver<QueuedRequest>,
+    output: mpsc::Sender<Value>,
+    active: ActiveMap,
+    server_shutdown: CancellationToken,
+    handler: H,
+) where
+    H: Fn(String, Value, Option<CancellationToken>) -> F,
+    F: std::future::Future<Output = Result<Value>>,
+{
+    while let Some(queued) = rx.recv().await {
+        let key = request_key(&queued.id);
+        let method = queued.method.clone();
+        let result = handler(queued.method, queued.params, queued.upload_cancellation).await;
+        match result {
+            Ok(value) => {
+                let _ = send_success(&output, queued.id, value).await;
+                if method == "shutdown" {
+                    server_shutdown.cancel();
+                }
+            }
+            Err(error) => {
+                let error = public_error(&error);
+                let _ = send_error(&output, queued.id, error.code, error.message).await;
+            }
+        }
+        active.lock().await.remove(&key);
+    }
+}
+
+enum CancelOutcome {
+    Cancelled,
+    NoActiveRequest,
+    NotCancellable,
+}
+
+async fn cancel_active(active: &ActiveMap, key: &str) -> CancelOutcome {
+    let active = active.lock().await;
+    match active.get(key) {
+        None => CancelOutcome::NoActiveRequest,
+        Some(ActiveKind::Other) => CancelOutcome::NotCancellable,
+        Some(ActiveKind::Upload(token)) => {
+            token.cancel();
+            CancelOutcome::Cancelled
+        }
+    }
+}
+
 async fn dispatch(
     controller: &JetKvmController,
     method: &str,
     params: Value,
-    cancellation: CancellationToken,
+    upload_cancellation: Option<CancellationToken>,
 ) -> Result<Value> {
     match method {
         "connect" => to_value(controller.reconnect().await?),
@@ -402,7 +563,6 @@ async fn dispatch(
             controller.disconnect().await?;
             Ok(Value::Null)
         }
-        "status" => to_value(controller.status().await?),
         "snapshot" => {
             let params = parse_params::<SnapshotParams>(params)?;
             let snapshot = match params.path {
@@ -413,36 +573,32 @@ async fn dispatch(
                             Approval {
                                 approved: params.approved,
                             },
+                            params.after,
                         )
                         .await?
                 }
-                None => controller.snapshot().await?,
+                None => controller.snapshot(params.after).await?,
             };
             to_value(snapshot)
         }
-        "key" => {
-            controller.key(parse_params(params)?).await?;
-            Ok(Value::Null)
-        }
-        "type_text" => {
+        "key" => to_value(controller.key(parse_params(params)?).await?),
+        "type_text" => to_value(
             controller
                 .type_text(parse_params::<TypeTextRequest>(params)?)
-                .await?;
-            Ok(Value::Null)
-        }
+                .await?,
+        ),
         "mouse_move" | "mouse_button" => {
-            match parse_params::<MouseMoveParams>(params)? {
+            let receipt = match parse_params::<MouseMoveParams>(params)? {
                 MouseMoveParams::Absolute(event) => controller.absolute_mouse(event).await?,
                 MouseMoveParams::Relative(event) => controller.relative_mouse(event).await?,
-            }
-            Ok(Value::Null)
+            };
+            to_value(receipt)
         }
-        "mouse_scroll" => {
+        "mouse_scroll" => to_value(
             controller
                 .scroll(parse_params::<ScrollEvent>(params)?)
-                .await?;
-            Ok(Value::Null)
-        }
+                .await?,
+        ),
         "media_state" => to_value(controller.media_state().await?),
         "check_mount_url" => {
             let params = parse_params::<UrlParams>(params)?;
@@ -498,6 +654,8 @@ async fn dispatch(
         "storage_files" => to_value(controller.storage_files().await?),
         "upload" => {
             let params = parse_params::<UploadParams>(params)?;
+            let cancellation =
+                upload_cancellation.context("upload request is missing its cancellation token")?;
             to_value(
                 controller
                     .upload(
@@ -513,7 +671,9 @@ async fn dispatch(
         }
         "mount_storage" => {
             let params = parse_params::<StorageFileParams>(params)?;
-            let mode = params.mode.context("mount_storage requires mode")?;
+            let mode = params.mode.ok_or_else(|| {
+                CodedError::new(codes::INVALID_PARAMS, "mount_storage requires mode")
+            })?;
             to_value(
                 controller
                     .mount_storage(
@@ -542,9 +702,12 @@ async fn dispatch(
             controller.shutdown().await?;
             Ok(Value::Null)
         }
-        _ => anyhow::bail!("unknown control method"),
+        other => {
+            Err(CodedError::new(codes::UNSUPPORTED, format!("unknown method: {other}")).into())
+        }
     }
 }
+
 fn capability_names(supports_check_mount_url: bool) -> Vec<&'static str> {
     let mut capabilities = vec![
         "connect",
@@ -574,58 +737,27 @@ fn capability_names(supports_check_mount_url: bool) -> Vec<&'static str> {
     capabilities
 }
 
-async fn wait_for_prior_requests(
-    active: &Mutex<HashMap<String, CancellationToken>>,
-    shutdown_key: &str,
-) -> Result<()> {
-    tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
-        loop {
-            let drained = {
-                let active = active.lock().await;
-                active.len() == 1 && active.contains_key(shutdown_key)
-            };
-            if drained {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .context("timed out waiting for active requests before shutdown")
-}
-
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Value) -> Result<T> {
-    serde_json::from_value(params).context("invalid method parameters")
+    serde_json::from_value(params)
+        .map_err(|error| CodedError::new(codes::INVALID_PARAMS, format!("invalid params: {error}")))
+        .map_err(Into::into)
 }
 
 fn to_value(value: impl Serialize) -> Result<Value> {
     serde_json::to_value(value).context("failed to encode method result")
 }
 
+/// Maps an internal error to a stable protocol code from its typed
+/// [`CodedError`] origin (no string classification); the message is always
+/// redacted as defense in depth.
 fn public_error(error: &anyhow::Error) -> ProtocolError {
-    let message = redact(format!("{error:#}"));
-    let code = if message.contains("approval") {
-        "approval_required"
-    } else if message.contains("not ready")
-        || message.contains("not connected")
-        || message.contains("stopped")
-    {
-        "not_connected"
-    } else if message.contains("timed out") {
-        "timeout"
-    } else if message.contains("cancelled") {
-        "cancelled"
-    } else if message.contains("not implemented") || message.contains("unsupported") {
-        "unsupported"
-    } else if message.contains("invalid") || message.contains("unknown control method") {
-        "invalid_request"
-    } else {
-        "operation_failed"
-    };
-    ProtocolError { code, message }
+    ProtocolError {
+        code: error_code(error),
+        message: redact(format!("{error:#}")),
+    }
 }
 
-fn redact(mut message: String) -> String {
+pub(crate) fn redact(mut message: String) -> String {
     let lowercase = message.to_ascii_lowercase();
     if let Some(index) = ["cookie:", "authorization:", "password=", "\"password\""]
         .into_iter()
@@ -721,6 +853,7 @@ fn read_ndjson_line<R: BufRead>(reader: &mut R, maximum: usize) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[test]
     fn framing_recovers_after_oversized_line() {
@@ -774,6 +907,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({})).expect("default snapshot params");
         assert!(owned.path.is_none());
         assert!(!owned.approved);
+        assert!(owned.after.is_none());
 
         let selected: SnapshotParams = serde_json::from_value(serde_json::json!({
             "path": "/tmp/selected.png",
@@ -785,8 +919,184 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_after_cursor_parses() {
+        let params: SnapshotParams = serde_json::from_value(serde_json::json!({
+            "after": { "generation": 3, "frame_id": 41 },
+        }))
+        .expect("snapshot params with cursor");
+        assert_eq!(
+            params.after,
+            Some(FrameCursor {
+                generation: 3,
+                frame_id: 41,
+            })
+        );
+    }
+
+    #[test]
     fn firmware_capabilities_omit_unsupported_url_check() {
         assert!(!capability_names(false).contains(&"check_mount_url"));
         assert!(capability_names(true).contains(&"check_mount_url"));
+    }
+
+    #[test]
+    fn public_error_maps_typed_codes_and_redacts() {
+        let coded = anyhow::Error::new(CodedError::new(
+            codes::APPROVAL_REQUIRED,
+            "explicit approval is required to mount media",
+        ))
+        .context("mount failed");
+        let error = public_error(&coded);
+        assert_eq!(error.code, codes::APPROVAL_REQUIRED);
+
+        let stale = anyhow::Error::new(CodedError::new(
+            codes::STALE_GENERATION,
+            "frame cursor generation 1 is stale",
+        ));
+        assert_eq!(public_error(&stale).code, codes::STALE_GENERATION);
+
+        let uncoded = anyhow::anyhow!("unexpected disk state");
+        assert_eq!(public_error(&uncoded).code, codes::OPERATION_FAILED);
+
+        let secret = anyhow::Error::new(CodedError::new(
+            codes::OPERATION_FAILED,
+            "mount failed for http://host/jetkvm-controller/media/secret-token",
+        ));
+        let error = public_error(&secret);
+        assert!(!error.message.contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn cancel_only_applies_to_active_uploads() {
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        assert!(matches!(
+            cancel_active(&active, "\"missing\"").await,
+            CancelOutcome::NoActiveRequest
+        ));
+
+        active
+            .lock()
+            .await
+            .insert("\"plain\"".to_owned(), ActiveKind::Other);
+        assert!(matches!(
+            cancel_active(&active, "\"plain\"").await,
+            CancelOutcome::NotCancellable
+        ));
+
+        let token = CancellationToken::new();
+        active
+            .lock()
+            .await
+            .insert("\"up\"".to_owned(), ActiveKind::Upload(token.clone()));
+        assert!(matches!(
+            cancel_active(&active, "\"up\"").await,
+            CancelOutcome::Cancelled
+        ));
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_executes_requests_in_input_order() {
+        let (output_tx, mut output_rx) = mpsc::channel(16);
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let server_shutdown = CancellationToken::new();
+        let (dispatch_tx, dispatch_rx) = mpsc::channel(16);
+
+        // The first request is artificially slow; completion order must
+        // still match input order.
+        let slow_first = Arc::new(std::sync::Mutex::new(VecDeque::from(vec![
+            std::time::Duration::from_millis(150),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        ])));
+        let handler_active = Arc::clone(&active);
+        let dispatcher = tokio::spawn(async move {
+            run_dispatcher(
+                dispatch_rx,
+                output_tx,
+                handler_active,
+                server_shutdown,
+                move |method, _params, _cancel| {
+                    let slow = slow_first
+                        .lock()
+                        .expect("delay queue")
+                        .pop_front()
+                        .unwrap_or(std::time::Duration::ZERO);
+                    async move {
+                        tokio::time::sleep(slow).await;
+                        Ok(Value::String(method))
+                    }
+                },
+            )
+            .await;
+        });
+
+        for (id, method) in ["first", "second", "third"].into_iter().enumerate() {
+            let id = Value::from(id);
+            active
+                .lock()
+                .await
+                .insert(request_key(&id), ActiveKind::Other);
+            dispatch_tx
+                .send(QueuedRequest {
+                    id,
+                    method: method.to_owned(),
+                    params: Value::Null,
+                    upload_cancellation: None,
+                })
+                .await
+                .expect("dispatcher accepts request");
+        }
+        drop(dispatch_tx);
+
+        let mut results = Vec::new();
+        while let Some(value) = output_rx.recv().await {
+            results.push(value);
+        }
+        dispatcher.await.expect("dispatcher completes");
+        let results: Vec<String> = results
+            .into_iter()
+            .map(|value| value["result"].as_str().expect("result").to_owned())
+            .collect();
+        assert_eq!(results, vec!["first", "second", "third"]);
+        assert!(active.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_shutdown_request_cancels_server_token() {
+        let (output_tx, output_rx) = mpsc::channel(4);
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let server_shutdown = CancellationToken::new();
+        let worker_shutdown = server_shutdown.clone();
+        let worker_active = Arc::clone(&active);
+        let (dispatch_tx, dispatch_rx) = mpsc::channel(4);
+        let dispatcher = tokio::spawn(async move {
+            run_dispatcher(
+                dispatch_rx,
+                output_tx,
+                worker_active,
+                worker_shutdown,
+                |_method, _, _| async { Ok(Value::Null) },
+            )
+            .await;
+        });
+
+        active
+            .lock()
+            .await
+            .insert(request_key(&Value::from("bye")), ActiveKind::Other);
+        dispatch_tx
+            .send(QueuedRequest {
+                id: Value::from("bye"),
+                method: "shutdown".to_owned(),
+                params: Value::Null,
+                upload_cancellation: None,
+            })
+            .await
+            .expect("dispatcher accepts request");
+        drop(dispatch_tx);
+        dispatcher.await.expect("dispatcher completes");
+        drop(output_rx);
+        assert!(server_shutdown.is_cancelled());
     }
 }

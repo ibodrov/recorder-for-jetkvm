@@ -3,6 +3,7 @@ pub mod config;
 pub mod control_protocol;
 pub mod controller;
 pub mod detector;
+mod error;
 mod h264;
 mod hid;
 mod keyboard;
@@ -16,6 +17,7 @@ mod signaling;
 mod video;
 mod virtual_media;
 
+pub use error::{CodedError, codes, error_code};
 pub use hid::{AbsoluteMouseEvent, HidStatus, KeyEvent, RelativeMouseEvent};
 pub use virtual_media::Approval;
 

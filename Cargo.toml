@@ -33,3 +33,6 @@ tempfile = "3"
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

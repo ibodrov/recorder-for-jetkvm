@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, warn};
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::auth::AuthenticatedClient;
+use crate::error::{CodedError, codes};
 use crate::hid::HidClient;
 use crate::range_server::{REDACTED_LOCAL_MEDIA_URL, RangeServer, is_controller_owned_url};
 use crate::rpc::{
@@ -34,7 +35,11 @@ pub struct Approval {
 impl Approval {
     pub fn require(self, operation: &str) -> Result<()> {
         if !self.approved {
-            bail!("explicit approval is required to {operation}");
+            return Err(CodedError::new(
+                codes::APPROVAL_REQUIRED,
+                format!("explicit approval is required to {operation}"),
+            )
+            .into());
         }
         Ok(())
     }
@@ -61,6 +66,9 @@ pub(crate) struct VirtualMediaManager {
     events: broadcast::Sender<MediaEvent>,
     range_server: Option<RangeServer>,
     stale_controller_mount: bool,
+    /// Origin proofs for uploads started by this manager, keyed by device
+    /// filename; survives reconnects so interrupted uploads can resume.
+    upload_origins: UploadOrigins,
 }
 
 impl VirtualMediaManager {
@@ -81,6 +89,7 @@ impl VirtualMediaManager {
             events,
             range_server: None,
             stale_controller_mount: false,
+            upload_origins: UploadOrigins::default(),
         }
     }
 
@@ -123,12 +132,19 @@ impl VirtualMediaManager {
         Ok(state.map(redact_state))
     }
 
-    pub async fn check_url(&self, url: &str) -> Result<MountUrlInfo> {
+    pub async fn check_url(&mut self, url: &str) -> Result<MountUrlInfo> {
         if !self.supports_check_mount_url {
             bail!("check_mount_url is unsupported by this JetKVM firmware");
         }
         validate_http_url(url)?;
-        self.rpc.check_mount_url(url).await
+        match self.rpc.check_mount_url(url).await {
+            Ok(info) => Ok(info),
+            Err(error) if is_check_mount_url_unimplemented(&error) => {
+                self.supports_check_mount_url = false;
+                Err(error).context("check_mount_url is unsupported by this JetKVM firmware")
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn mount_url(
@@ -141,11 +157,23 @@ impl VirtualMediaManager {
         validate_http_url(url)?;
         self.ensure_unmounted().await?;
         let expected_size = if self.supports_check_mount_url {
-            let checked = self.rpc.check_mount_url(url).await?;
-            if !checked.usable {
-                bail!("mount URL is unusable: {}", checked.reason);
+            match self.rpc.check_mount_url(url).await {
+                Ok(checked) => {
+                    if !checked.usable {
+                        bail!("mount URL is unusable: {}", checked.reason);
+                    }
+                    Some(checked.size)
+                }
+                Err(error) if is_check_mount_url_unimplemented(&error) => {
+                    warn!(
+                        "checkMountUrl is not implemented by this firmware build; \
+                         disabling preflight URL checks"
+                    );
+                    self.supports_check_mount_url = false;
+                    None
+                }
+                Err(error) => return Err(error),
             }
-            Some(checked.size)
         } else {
             None
         };
@@ -178,18 +206,25 @@ impl VirtualMediaManager {
         server.ensure_healthy()?;
         let url = server.mount_url().to_owned();
         let expected_size = if self.supports_check_mount_url {
-            let checked = match self.rpc.check_mount_url(&url).await {
-                Ok(checked) if checked.usable => checked,
+            match self.rpc.check_mount_url(&url).await {
+                Ok(checked) if checked.usable => Some(checked.size),
                 Ok(checked) => {
                     server.shutdown().await?;
                     bail!("JetKVM cannot read the local image: {}", checked.reason);
+                }
+                Err(error) if is_check_mount_url_unimplemented(&error) => {
+                    warn!(
+                        "checkMountUrl is not implemented by this firmware build; \
+                         disabling preflight URL checks"
+                    );
+                    self.supports_check_mount_url = false;
+                    None
                 }
                 Err(error) => {
                     server.shutdown().await?;
                     return Err(error).context("failed to validate controller-hosted image");
                 }
-            };
-            Some(checked.size)
+            }
         } else {
             None
         };
@@ -242,14 +277,27 @@ impl VirtualMediaManager {
         Ok(self.rpc.storage_files().await?.files)
     }
 
+    /// Uploads a local image to device storage, resuming an interrupted
+    /// upload when the device holds a partial with a matching origin.
+    ///
+    /// Admission order (TO_FIX §6): validate inputs, obtain the resume
+    /// offset, verify the offset and the source identity, check free space
+    /// against the *remaining* bytes, transfer the remaining range, verify
+    /// the completed file. A partial upload is never deleted implicitly; a
+    /// partial whose origin is unknown or different is rejected so two
+    /// different images can never be spliced.
     pub async fn upload(
-        &self,
+        &mut self,
         image: &Path,
         filename: &str,
         approval: Approval,
         cancellation: CancellationToken,
     ) -> Result<StorageFile> {
         approval.require("upload a local image")?;
+        if cancellation.is_cancelled() {
+            return upload_cancelled("before it started");
+        }
+        validate_filename(filename)?;
         let canonical = tokio::fs::canonicalize(image)
             .await
             .with_context(|| format!("failed to canonicalize upload image: {}", image.display()))?;
@@ -259,51 +307,125 @@ impl VirtualMediaManager {
         if !metadata.is_file() || metadata.len() == 0 {
             bail!("upload image must be a non-empty regular file");
         }
-        validate_filename(filename)?;
         let size = metadata.len();
-        let space = self.rpc.storage_space().await?;
-        if size > space.bytes_free {
-            bail!("image is larger than available JetKVM storage");
+        if cancellation.is_cancelled() {
+            return upload_cancelled("before disclosing the local image");
         }
+        let origin = read_upload_origin(&canonical).await?;
 
+        if cancellation.is_cancelled() {
+            return upload_cancelled("before creating the upload");
+        }
+        // A previous attempt in this process may have been cancelled while
+        // its device-side handler still drains buffered bytes into the same
+        // `.incomplete` file. Wait for the partial to stop growing so the
+        // resume offset is stable.
+        if self.upload_origins.0.contains_key(filename) {
+            self.settle_partial_upload(filename).await;
+        }
         let upload = self.rpc.start_upload(filename, size).await?;
-        validate_upload_offset(upload.already_uploaded_bytes, size)?;
-        let http_result = upload_over_http(
-            &self.auth,
-            &upload.upload_id,
-            UploadTransfer {
-                path: &canonical,
-                filename,
-                total: size,
-                uploaded: upload.already_uploaded_bytes,
-                events: &self.events,
-                cancellation: &cancellation,
-            },
-        )
-        .await;
-        if http_result.is_err() {
-            if cancellation.is_cancelled() {
-                bail!("upload cancelled");
+        let mut uploaded = upload.already_uploaded_bytes;
+        validate_upload_offset(uploaded, size)?;
+        debug!(
+            filename,
+            size,
+            already_uploaded = uploaded,
+            "storage upload registered with JetKVM"
+        );
+        self.verify_upload_origin(filename, origin, uploaded)?;
+
+        let remaining = size - uploaded;
+        if remaining > 0 {
+            let space = self.rpc.storage_space().await?;
+            if remaining > space.bytes_free {
+                return Err(CodedError::new(
+                    codes::OPERATION_FAILED,
+                    format!(
+                        "JetKVM storage has {} bytes free but the upload needs {remaining} more; \
+                         the partial upload is kept for resume",
+                        space.bytes_free
+                    ),
+                )
+                .into());
             }
-            warn!("direct HTTP storage upload failed; falling back to WebRTC");
-            let upload = self.rpc.start_upload(filename, size).await?;
-            validate_upload_offset(upload.already_uploaded_bytes, size)?;
-            upload_over_data_channel(
-                &self.peer_connection,
+            let http_result = upload_over_http(
+                &self.auth,
                 &upload.upload_id,
                 UploadTransfer {
                     path: &canonical,
                     filename,
                     total: size,
-                    uploaded: upload.already_uploaded_bytes,
+                    uploaded,
                     events: &self.events,
                     cancellation: &cancellation,
                 },
             )
-            .await?;
+            .await;
+            if let Err(http_error) = http_result {
+                if cancellation.is_cancelled() {
+                    return upload_cancelled("during HTTP transfer");
+                }
+                warn!(%http_error, "direct HTTP storage upload failed; falling back to WebRTC");
+                if cancellation.is_cancelled() {
+                    return upload_cancelled("before the WebRTC fallback");
+                }
+                // Re-read the resume offset: the HTTP attempt may have
+                // advanced the device's partial upload.
+                let upload = self.rpc.start_upload(filename, size).await?;
+                uploaded = upload.already_uploaded_bytes;
+                validate_upload_offset(uploaded, size)?;
+                upload_over_data_channel(
+                    &self.peer_connection,
+                    &upload.upload_id,
+                    UploadTransfer {
+                        path: &canonical,
+                        filename,
+                        total: size,
+                        uploaded,
+                        events: &self.events,
+                        cancellation: &cancellation,
+                    },
+                )
+                .await?;
+            }
         }
 
         wait_for_storage_file(&self.rpc, filename, size, &cancellation).await
+    }
+
+    /// Polls until the device-side partial stops growing across two polls,
+    /// so a cancelled transfer's handler has fully drained before we ask
+    /// for a resume offset.
+    async fn settle_partial_upload(&self, filename: &str) {
+        let partial = format!("{filename}.incomplete");
+        let mut last: Option<u64> = None;
+        for _ in 0..16 {
+            let size = self.rpc.storage_files().await.ok().and_then(|files| {
+                files
+                    .files
+                    .into_iter()
+                    .find(|file| file.filename == partial)
+                    .map(|file| file.size)
+            });
+            if size == last && size.is_some() {
+                return;
+            }
+            last = size;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        warn!(filename, "partial upload did not settle before resume");
+    }
+
+    /// Origin check for resumed uploads. Fresh uploads (offset 0) record
+    /// their origin; resumes must match the recorded origin (size and
+    /// leading bytes) exactly.
+    fn verify_upload_origin(
+        &mut self,
+        filename: &str,
+        origin: UploadOrigin,
+        uploaded: u64,
+    ) -> Result<()> {
+        self.upload_origins.verify(filename, &origin, uploaded)
     }
 
     pub async fn mount_storage(
@@ -435,6 +557,84 @@ fn validate_upload_offset(uploaded: u64, total: u64) -> Result<()> {
     Ok(())
 }
 
+/// Number of leading image bytes kept as an upload origin proof.
+const UPLOAD_ORIGIN_PREFIX_BYTES: usize = 4096;
+
+/// Best-available origin proof for a resumable upload: total size plus the
+/// leading bytes of the source image. Device-side partials without a
+/// matching proof are rejected rather than silently spliced onto a
+/// different image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UploadOrigin {
+    size: u64,
+    prefix: Bytes,
+}
+
+/// Per-filename origin proofs for uploads started by this controller. A
+/// device-side partial upload with no matching proof is rejected so two
+/// different images can never be spliced across a resume.
+#[derive(Debug, Default)]
+struct UploadOrigins(std::collections::HashMap<String, UploadOrigin>);
+
+impl UploadOrigins {
+    fn verify(&mut self, filename: &str, origin: &UploadOrigin, uploaded: u64) -> Result<()> {
+        if uploaded == 0 {
+            self.0.insert(filename.to_owned(), origin.clone());
+            return Ok(());
+        }
+        match self.0.get(filename) {
+            Some(recorded) if recorded == origin => Ok(()),
+            Some(_) => Err(CodedError::new(
+                codes::OPERATION_FAILED,
+                format!(
+                    "a partial upload named '{filename}' belongs to a different local image; \
+                     refusing to splice — delete the partial with delete_storage first"
+                ),
+            )
+            .into()),
+            None => Err(CodedError::new(
+                codes::OPERATION_FAILED,
+                format!(
+                    "a partial upload named '{filename}' has no recorded origin in this \
+                     controller; refusing to resume — delete it with delete_storage first \
+                     or resume from the controller session that started it"
+                ),
+            )
+            .into()),
+        }
+    }
+}
+
+async fn read_upload_origin(path: &Path) -> Result<UploadOrigin> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .context("failed to inspect upload image")?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .context("failed to open upload image")?;
+    let mut prefix = vec![0_u8; UPLOAD_ORIGIN_PREFIX_BYTES];
+    let mut read = 0_usize;
+    loop {
+        let count = file
+            .read(&mut prefix[read..])
+            .await
+            .context("failed to read upload image")?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+    }
+    prefix.truncate(read);
+    Ok(UploadOrigin {
+        size: metadata.len(),
+        prefix: Bytes::from(prefix),
+    })
+}
+
+fn upload_cancelled<T>(stage: &str) -> Result<T> {
+    Err(CodedError::new(codes::CANCELLED, format!("upload cancelled {stage}")).into())
+}
+
 struct UploadTransfer<'a> {
     path: &'a Path,
     filename: &'a str,
@@ -472,7 +672,7 @@ async fn upload_over_http(
         .timeout(upload_timeout(total - uploaded))
         .send();
     let response = tokio::select! {
-        _ = cancellation.cancelled() => bail!("upload cancelled"),
+        _ = cancellation.cancelled() => return upload_cancelled("during HTTP transfer"),
         response = request => response.context("storage upload request failed")?,
     };
     if !response.status().is_success() {
@@ -527,81 +727,87 @@ async fn upload_over_data_channel(
     {
         let _ = channel.close().await;
         if cancellation.is_cancelled() {
-            bail!("upload cancelled");
+            return upload_cancelled("while opening the upload channel");
         }
         return Err(error).context("failed to open WebRTC upload channel");
     }
 
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .context("failed to open upload image")?;
-    file.seek(std::io::SeekFrom::Start(uploaded))
-        .await
-        .context("failed to seek upload image")?;
-    let mut sent = uploaded;
-    let mut last_progress = Instant::now() - PROGRESS_INTERVAL;
-    while sent < total {
-        while channel.buffered_amount().await > DATA_CHANNEL_BUFFER_HIGH {
-            tokio::select! {
-                _ = cancellation.cancelled() => {
-                    let _ = channel.close().await;
-                    bail!("upload cancelled");
-                }
-                _ = buffer_low.notified() => {}
-                _ = closed.notified() => {
-                    bail!("WebRTC upload channel closed before upload completed");
-                }
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    bail!("WebRTC upload channel backpressure timed out");
-                }
-            }
-        }
-        if channel.ready_state() != RTCDataChannelState::Open {
-            bail!("WebRTC upload channel closed before upload completed");
-        }
-        let length = usize::try_from((total - sent).min(UPLOAD_CHUNK_SIZE as u64))
-            .expect("bounded upload chunk fits usize");
-        let mut buffer = vec![0_u8; length];
-        tokio::select! {
-            _ = cancellation.cancelled() => {
-                let _ = channel.close().await;
-                bail!("upload cancelled");
-            }
-            result = file.read_exact(&mut buffer) => {
-                result.context("failed to read upload image")?;
-            }
-        }
-        channel
-            .send(&Bytes::from(buffer))
+    // Every error exit after the channel opened must close it: the device
+    // keeps the pending upload open until channel closure.
+    let transfer = async {
+        let mut file = tokio::fs::File::open(path)
             .await
-            .context("failed to send WebRTC upload data")?;
-        sent += length as u64;
-        if last_progress.elapsed() >= PROGRESS_INTERVAL || sent == total {
-            let _ = events.send(MediaEvent::UploadProgress {
-                filename: filename.to_owned(),
-                uploaded_bytes: sent,
-                total_bytes: total,
-            });
-            last_progress = Instant::now();
-        }
-    }
-
-    tokio::time::timeout(upload_timeout(total - uploaded), async {
-        loop {
-            if channel.ready_state() == RTCDataChannelState::Closed {
-                return Ok(());
+            .context("failed to open upload image")?;
+        file.seek(std::io::SeekFrom::Start(uploaded))
+            .await
+            .context("failed to seek upload image")?;
+        let mut sent = uploaded;
+        let mut last_progress = Instant::now() - PROGRESS_INTERVAL;
+        while sent < total {
+            while channel.buffered_amount().await > DATA_CHANNEL_BUFFER_HIGH {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return upload_cancelled("during transfer");
+                    }
+                    _ = buffer_low.notified() => {}
+                    _ = closed.notified() => {
+                        bail!("WebRTC upload channel closed before upload completed");
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                        bail!("WebRTC upload channel backpressure timed out");
+                    }
+                }
             }
+            if channel.ready_state() != RTCDataChannelState::Open {
+                bail!("WebRTC upload channel closed before upload completed");
+            }
+            let length = usize::try_from((total - sent).min(UPLOAD_CHUNK_SIZE as u64))
+                .expect("bounded upload chunk fits usize");
+            let mut buffer = vec![0_u8; length];
             tokio::select! {
                 _ = cancellation.cancelled() => {
-                    let _ = channel.close().await;
-                    bail!("upload cancelled");
+                    return upload_cancelled("during transfer");
                 }
-                _ = closed.notified() => {}
+                result = file.read_exact(&mut buffer) => {
+                    result.context("failed to read upload image")?;
+                }
+            }
+            channel
+                .send(&Bytes::from(buffer))
+                .await
+                .context("failed to send WebRTC upload data")?;
+            sent += length as u64;
+            if last_progress.elapsed() >= PROGRESS_INTERVAL || sent == total {
+                let _ = events.send(MediaEvent::UploadProgress {
+                    filename: filename.to_owned(),
+                    uploaded_bytes: sent,
+                    total_bytes: total,
+                });
+                last_progress = Instant::now();
             }
         }
-    })
-    .await
-    .context("timed out waiting for WebRTC upload completion")?
+
+        tokio::time::timeout(upload_timeout(total - uploaded), async {
+            loop {
+                if channel.ready_state() == RTCDataChannelState::Closed {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return upload_cancelled("while waiting for completion");
+                    }
+                    _ = closed.notified() => {}
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for WebRTC upload completion")?
+    }
+    .await;
+    if transfer.is_err() {
+        let _ = channel.close().await;
+    }
+    transfer
 }
 
 async fn wait_for_storage_file(
@@ -619,7 +825,7 @@ async fn wait_for_storage_file(
             return Ok(file);
         }
         tokio::select! {
-            _ = cancellation.cancelled() => bail!("upload cancelled"),
+            _ = cancellation.cancelled() => return upload_cancelled("while waiting for the completed file"),
             _ = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
     }
@@ -665,6 +871,16 @@ fn upload_stream(
     )
 }
 
+/// True when the device rejected `checkMountUrl` as unknown or unimplemented
+/// (firmware builds that register the method as a stub or not at all).
+fn is_check_mount_url_unimplemented(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("not implemented")
+        || message.contains("method not found")
+        || message.contains("unknown method")
+        || message.contains("remote rpc error -32601")
+}
+
 fn validate_http_url(url: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(url).context("invalid media URL")?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -706,11 +922,347 @@ fn redact_state(mut state: VirtualMediaState) -> VirtualMediaState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+    use serde_json::{Value, json};
     use webrtc::api::APIBuilder;
     use webrtc::api::media_engine::MediaEngine;
+    use webrtc::data_channel::RTCDataChannel;
     use webrtc::peer_connection::configuration::RTCConfiguration;
+
+    #[derive(Clone, Debug)]
+    struct ObservedTransfer {
+        upload_id: String,
+        bytes: Vec<u8>,
+    }
+
+    struct MockStorage {
+        bytes_free: AtomicU64,
+        filename: String,
+        size: u64,
+        offsets: tokio::sync::Mutex<VecDeque<u64>>,
+        expected: tokio::sync::Mutex<HashMap<String, usize>>,
+        transfers: tokio::sync::Mutex<Vec<ObservedTransfer>>,
+        files: tokio::sync::Mutex<Vec<StorageFile>>,
+        start_calls: AtomicUsize,
+        delete_calls: AtomicUsize,
+    }
+
+    impl MockStorage {
+        fn new(bytes_free: u64, filename: &str, size: u64, offsets: &[u64]) -> Arc<Self> {
+            Arc::new(Self {
+                bytes_free: AtomicU64::new(bytes_free),
+                filename: filename.to_owned(),
+                size,
+                offsets: tokio::sync::Mutex::new(offsets.iter().copied().collect()),
+                expected: tokio::sync::Mutex::new(HashMap::new()),
+                transfers: tokio::sync::Mutex::new(Vec::new()),
+                files: tokio::sync::Mutex::new(Vec::new()),
+                start_calls: AtomicUsize::new(0),
+                delete_calls: AtomicUsize::new(0),
+            })
+        }
+
+        async fn respond(&self, request: Value) -> Value {
+            match request["method"].as_str().expect("RPC method") {
+                "getStorageSpace" => json!({
+                    "bytesUsed": 0,
+                    "bytesFree": self.bytes_free.load(Ordering::SeqCst),
+                }),
+                "startStorageFileUpload" => {
+                    let call = self.start_calls.fetch_add(1, Ordering::SeqCst);
+                    let offset = self
+                        .offsets
+                        .lock()
+                        .await
+                        .pop_front()
+                        .expect("scripted startStorageFileUpload response");
+                    let upload_id = format!("upload-{call}");
+                    self.expected
+                        .lock()
+                        .await
+                        .insert(upload_id.clone(), self.size.saturating_sub(offset) as usize);
+                    json!({
+                        "alreadyUploadedBytes": offset,
+                        "dataChannel": upload_id,
+                    })
+                }
+                "listStorageFiles" => json!({
+                    "files": self.files.lock().await.clone(),
+                }),
+                "deleteStorageFile" => {
+                    self.delete_calls.fetch_add(1, Ordering::SeqCst);
+                    json!({})
+                }
+                method => panic!("unexpected mock storage RPC: {method}"),
+            }
+        }
+
+        async fn observe_upload_channel(self: Arc<Self>, channel: Arc<RTCDataChannel>) {
+            let upload_id = channel.label().to_owned();
+            self.transfers.lock().await.push(ObservedTransfer {
+                upload_id: upload_id.clone(),
+                bytes: Vec::new(),
+            });
+            let storage = Arc::clone(&self);
+            let message_channel = Arc::clone(&channel);
+            channel.on_message(Box::new(move |message| {
+                let storage = Arc::clone(&storage);
+                let channel = Arc::clone(&message_channel);
+                let upload_id = upload_id.clone();
+                Box::pin(async move {
+                    let expected = *storage
+                        .expected
+                        .lock()
+                        .await
+                        .get(&upload_id)
+                        .expect("unexpected upload data channel");
+                    let complete = {
+                        let mut transfers = storage.transfers.lock().await;
+                        let transfer = transfers
+                            .iter_mut()
+                            .find(|transfer| transfer.upload_id == upload_id)
+                            .expect("recorded upload data channel");
+                        transfer.bytes.extend_from_slice(&message.data);
+                        assert!(
+                            transfer.bytes.len() <= expected,
+                            "upload channel sent more bytes than the resume range"
+                        );
+                        transfer.bytes.len() == expected
+                    };
+                    if complete {
+                        let mut files = storage.files.lock().await;
+                        if !files.iter().any(|file| file.filename == storage.filename) {
+                            files.push(StorageFile {
+                                filename: storage.filename.clone(),
+                                size: storage.size,
+                                created_at: "now".to_owned(),
+                            });
+                        }
+                        drop(files);
+                        channel
+                            .close()
+                            .await
+                            .expect("close completed upload channel");
+                    }
+                })
+            }));
+        }
+
+        async fn transfers(&self) -> Vec<ObservedTransfer> {
+            self.transfers.lock().await.clone()
+        }
+    }
+
+    struct UploadHarness {
+        manager: VirtualMediaManager,
+        storage: Arc<MockStorage>,
+        answer_peer: Arc<RTCPeerConnection>,
+    }
+
+    impl UploadHarness {
+        async fn close(self) {
+            self.answer_peer.close().await.expect("close mock peer");
+        }
+    }
+
+    async fn upload_harness(
+        bytes_free: u64,
+        filename: &str,
+        size: u64,
+        offsets: &[u64],
+    ) -> UploadHarness {
+        let storage = MockStorage::new(bytes_free, filename, size, offsets);
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_default_codecs()
+            .expect("default codecs");
+        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let offer_peer = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("offer peer"),
+        );
+        let answer_peer = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("answer peer"),
+        );
+        let rpc_channel = offer_peer
+            .create_data_channel("rpc", None)
+            .await
+            .expect("RPC data channel");
+        let hid_reliable = offer_peer
+            .create_data_channel("hid-reliable", None)
+            .await
+            .expect("reliable HID data channel");
+        let hid_ordered = offer_peer
+            .create_data_channel("hid-ordered", None)
+            .await
+            .expect("ordered HID data channel");
+        let hid_unordered = offer_peer
+            .create_data_channel("hid-unordered", None)
+            .await
+            .expect("unordered HID data channel");
+        let storage_for_channels = Arc::clone(&storage);
+        answer_peer.on_data_channel(Box::new(move |channel| {
+            let storage = Arc::clone(&storage_for_channels);
+            Box::pin(async move {
+                if channel.label() == "rpc" {
+                    let response_channel = Arc::clone(&channel);
+                    channel.on_message(Box::new(move |message| {
+                        let storage = Arc::clone(&storage);
+                        let response_channel = Arc::clone(&response_channel);
+                        Box::pin(async move {
+                            let request: Value =
+                                serde_json::from_slice(&message.data).expect("parse RPC request");
+                            let id = request["id"].clone();
+                            let result = storage.respond(request).await;
+                            response_channel
+                                .send_text(
+                                    serde_json::to_string(&json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": result,
+                                    }))
+                                    .expect("serialize RPC response"),
+                                )
+                                .await
+                                .expect("send RPC response");
+                        })
+                    }));
+                } else if channel.label().starts_with("upload-") {
+                    storage.observe_upload_channel(channel).await;
+                }
+            })
+        }));
+
+        connect_loopback(&offer_peer, &answer_peer).await;
+        let rpc = RpcClient::new(rpc_channel);
+        rpc.wait_ready(Duration::from_secs(5))
+            .await
+            .expect("RPC channel open");
+        let hid = HidClient::new(hid_reliable, hid_ordered, hid_unordered);
+        let (events, _) = broadcast::channel(4);
+        UploadHarness {
+            manager: VirtualMediaManager::new(
+                rpc,
+                AuthenticatedClient::test_client(),
+                hid,
+                offer_peer,
+                false,
+                events,
+            ),
+            storage,
+            answer_peer,
+        }
+    }
+
+    async fn connect_loopback(
+        offer_peer: &Arc<RTCPeerConnection>,
+        answer_peer: &Arc<RTCPeerConnection>,
+    ) {
+        let offer = offer_peer.create_offer(None).await.expect("offer");
+        let mut offer_gathering = offer_peer.gathering_complete_promise().await;
+        offer_peer
+            .set_local_description(offer)
+            .await
+            .expect("set offer");
+        offer_gathering.recv().await;
+        answer_peer
+            .set_remote_description(
+                offer_peer
+                    .local_description()
+                    .await
+                    .expect("gathered offer"),
+            )
+            .await
+            .expect("apply offer");
+        let answer = answer_peer.create_answer(None).await.expect("answer");
+        let mut answer_gathering = answer_peer.gathering_complete_promise().await;
+        answer_peer
+            .set_local_description(answer)
+            .await
+            .expect("set answer");
+        answer_gathering.recv().await;
+        offer_peer
+            .set_remote_description(
+                answer_peer
+                    .local_description()
+                    .await
+                    .expect("gathered answer"),
+            )
+            .await
+            .expect("apply answer");
+    }
+
+    fn upload_fixture(size: usize) -> (tempfile::NamedTempFile, Vec<u8>) {
+        let bytes = (37_u8..=255).cycle().take(size).collect::<Vec<_>>();
+        let file = tempfile::NamedTempFile::new().expect("temporary upload file");
+        std::fs::write(file.path(), &bytes).expect("write upload fixture");
+        (file, bytes)
+    }
+
+    async fn establish_upload_origin(harness: &mut UploadHarness, image: &Path, filename: &str) {
+        harness
+            .manager
+            .upload(
+                image,
+                filename,
+                Approval { approved: true },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("fresh upload establishes its origin");
+    }
+
+    #[test]
+    fn upload_origins_bind_resume_to_the_same_source() {
+        let mut origins = UploadOrigins::default();
+        let image_a = UploadOrigin {
+            size: 10_000,
+            prefix: Bytes::from_static(b"image-a-prefix"),
+        };
+        // Fresh upload records its origin.
+        origins
+            .verify("disk.iso", &image_a, 0)
+            .expect("fresh upload records its origin");
+        // Resume with the same source is admitted.
+        origins
+            .verify("disk.iso", &image_a, 4096)
+            .expect("same-origin resume is admitted");
+        // Same name and size but different content is rejected (no splice).
+        let image_b = UploadOrigin {
+            size: 10_000,
+            prefix: Bytes::from_static(b"image-b-prefix"),
+        };
+        let error = origins
+            .verify("disk.iso", &image_b, 4096)
+            .expect_err("different source must not resume");
+        assert_eq!(crate::error::error_code(&error), codes::OPERATION_FAILED);
+        assert!(error.to_string().contains("different local image"));
+        // A partial from an unknown origin is rejected as well.
+        let error = origins
+            .verify("other.iso", &image_a, 2048)
+            .expect_err("unknown-origin partial must not resume");
+        assert!(error.to_string().contains("no recorded origin"));
+        // Identity check only applies to actual resumes.
+        origins
+            .verify("other.iso", &image_a, 0)
+            .expect("fresh upload for another file records identity");
+    }
+
+    #[test]
+    fn check_mount_url_unimplemented_is_classified() {
+        let stub = anyhow::anyhow!("remote RPC error -32601: not implemented");
+        assert!(is_check_mount_url_unimplemented(&stub));
+        let method_missing = anyhow::anyhow!("remote RPC error -32601: method not found");
+        assert!(is_check_mount_url_unimplemented(&method_missing));
+        let other = anyhow::anyhow!("remote RPC error -32000: storage full");
+        assert!(!is_check_mount_url_unimplemented(&other));
+    }
 
     #[test]
     fn approval_is_required_for_mutation() {
@@ -773,12 +1325,206 @@ mod tests {
         }
     }
 
-    #[test]
-    fn progress_resume_math_starts_at_reported_offset() {
-        let offset = 4096_u64;
-        let total = 10_000_u64;
-        assert_eq!(total - offset, 5904);
-        assert!(offset <= total);
+    #[tokio::test]
+    async fn upload_resume_admits_remaining_bytes_that_fit_and_sends_no_prefix() {
+        let filename = "resume.iso";
+        let (file, bytes) = upload_fixture(24 * 1024);
+        let offset = 8 * 1024_u64;
+        let mut harness = upload_harness(
+            bytes.len() as u64,
+            filename,
+            bytes.len() as u64,
+            &[0, 0, offset, offset],
+        )
+        .await;
+        establish_upload_origin(&mut harness, file.path(), filename).await;
+        harness
+            .storage
+            .bytes_free
+            .store((bytes.len() as u64) - offset, Ordering::SeqCst);
+
+        harness
+            .manager
+            .upload(
+                file.path(),
+                filename,
+                Approval { approved: true },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("resume admitted when only the remaining range fits");
+
+        let transfers = harness.storage.transfers().await;
+        assert_eq!(
+            transfers.len(),
+            2,
+            "each completed upload uses one fallback channel"
+        );
+        assert_eq!(transfers[1].bytes, bytes[offset as usize..]);
+        assert_eq!(harness.storage.start_calls.load(Ordering::SeqCst), 4);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_when_remaining_bytes_exceed_free_space_without_transfer_or_delete() {
+        let filename = "too-large.iso";
+        let (file, bytes) = upload_fixture(24 * 1024);
+        let offset = 8 * 1024_u64;
+        let mut harness = upload_harness(
+            bytes.len() as u64,
+            filename,
+            bytes.len() as u64,
+            &[0, 0, offset],
+        )
+        .await;
+        establish_upload_origin(&mut harness, file.path(), filename).await;
+        let transfers_before = harness.storage.transfers().await;
+        let remaining = (bytes.len() as u64) - offset;
+        harness
+            .storage
+            .bytes_free
+            .store(remaining - 1, Ordering::SeqCst);
+        let error = harness
+            .manager
+            .upload(
+                file.path(),
+                filename,
+                Approval { approved: true },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("remaining range must be rejected before transfer");
+
+        assert!(error.to_string().contains("bytes free"));
+        assert!(error.to_string().contains("needs"));
+        assert_eq!(
+            harness.storage.transfers().await.len(),
+            transfers_before.len()
+        );
+        assert_eq!(harness.storage.delete_calls.load(Ordering::SeqCst), 0);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn upload_at_completed_resume_offset_verifies_without_another_transfer() {
+        let filename = "complete.iso";
+        let (file, bytes) = upload_fixture(24 * 1024);
+        let mut harness = upload_harness(
+            bytes.len() as u64,
+            filename,
+            bytes.len() as u64,
+            &[0, 0, bytes.len() as u64],
+        )
+        .await;
+        establish_upload_origin(&mut harness, file.path(), filename).await;
+        let transfers_before = harness.storage.transfers().await;
+
+        let stored = harness
+            .manager
+            .upload(
+                file.path(),
+                filename,
+                Approval { approved: true },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("completed resume offset verifies stored file");
+
+        assert_eq!(stored.filename, filename);
+        assert_eq!(stored.size, bytes.len() as u64);
+        assert_eq!(
+            harness.storage.transfers().await.len(),
+            transfers_before.len()
+        );
+        assert_eq!(harness.storage.start_calls.load(Ordering::SeqCst), 3);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_resume_offset_past_end_without_transfer() {
+        let filename = "invalid-offset.iso";
+        let (file, bytes) = upload_fixture(24 * 1024);
+        let mut harness = upload_harness(
+            bytes.len() as u64,
+            filename,
+            bytes.len() as u64,
+            &[(bytes.len() as u64) + 1],
+        )
+        .await;
+
+        let error = harness
+            .manager
+            .upload(
+                file.path(),
+                filename,
+                Approval { approved: true },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("past-end resume offset must fail");
+
+        assert!(error.to_string().contains("invalid upload resume offset"));
+        assert!(harness.storage.transfers().await.is_empty());
+        assert_eq!(harness.storage.start_calls.load(Ordering::SeqCst), 1);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn upload_fallback_re_reads_the_advanced_resume_offset() {
+        let filename = "fallback.iso";
+        let (file, bytes) = upload_fixture(24 * 1024);
+        let advanced = 12 * 1024_u64;
+        let mut harness = upload_harness(
+            bytes.len() as u64,
+            filename,
+            bytes.len() as u64,
+            &[0, advanced],
+        )
+        .await;
+
+        harness
+            .manager
+            .upload(
+                file.path(),
+                filename,
+                Approval { approved: true },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("HTTP failure falls back to the advanced resume offset");
+
+        let transfers = harness.storage.transfers().await;
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].upload_id, "upload-1");
+        assert_eq!(transfers[0].bytes, bytes[advanced as usize..]);
+        assert_eq!(harness.storage.start_calls.load(Ordering::SeqCst), 2);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn upload_pre_cancelled_token_never_starts_remote_upload() {
+        let filename = "cancelled.iso";
+        let (file, bytes) = upload_fixture(24 * 1024);
+        let mut harness =
+            upload_harness(bytes.len() as u64, filename, bytes.len() as u64, &[0]).await;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = harness
+            .manager
+            .upload(
+                file.path(),
+                filename,
+                Approval { approved: true },
+                cancellation,
+            )
+            .await
+            .expect_err("pre-cancelled upload must fail");
+
+        assert_eq!(crate::error::error_code(&error), codes::CANCELLED);
+        assert_eq!(harness.storage.start_calls.load(Ordering::SeqCst), 0);
+        assert!(harness.storage.transfers().await.is_empty());
+        harness.close().await;
     }
 
     #[tokio::test]

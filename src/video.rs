@@ -1,20 +1,37 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::error::{CodedError, codes};
 use crate::h264::{NAL_TYPE_IDR, NalUnit};
 use crate::screenshot;
+
+/// Monotonic frame ID source. Frame IDs are globally unique and increasing;
+/// cursors are always validated against the connection generation.
+static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Identifies a decoded frame within a connection generation. A snapshot or
+/// action receipt carrying a cursor lets callers wait for a strictly newer
+/// frame via `snapshot`'s `after` parameter.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FrameCursor {
+    pub generation: u64,
+    pub frame_id: u64,
+}
 
 struct DecodedFrame {
     frame: ffmpeg_the_third::frame::Video,
     received_at: Instant,
     captured_at: SystemTime,
     generation: u64,
+    frame_id: u64,
 }
 
 #[derive(Clone)]
@@ -25,6 +42,7 @@ pub struct LatestFrameCache {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameInfo {
     pub generation: u64,
+    pub frame_id: u64,
     pub age: Duration,
     pub width: u32,
     pub height: u32,
@@ -38,6 +56,7 @@ pub struct SnapshotFile {
     pub width: u32,
     pub height: u32,
     pub generation: u64,
+    pub frame_id: u64,
     pub frame_age: Duration,
     pub captured_at: SystemTime,
 }
@@ -55,6 +74,7 @@ impl LatestFrameCache {
     pub fn info(&self) -> Option<FrameInfo> {
         self.sender.borrow().as_ref().map(|frame| FrameInfo {
             generation: frame.generation,
+            frame_id: frame.frame_id,
             age: frame.received_at.elapsed(),
             width: frame.frame.width(),
             height: frame.frame.height(),
@@ -62,17 +82,34 @@ impl LatestFrameCache {
         })
     }
 
+    /// Waits for a decoded frame of `generation`, strictly newer than
+    /// `after` when supplied, and writes it as PNG. A cursor from another
+    /// generation fails immediately with `stale_generation`.
     pub async fn snapshot(
         &self,
         output: &Path,
         generation: u64,
+        after: Option<FrameCursor>,
         timeout: Duration,
     ) -> Result<SnapshotFile> {
+        if let Some(after) = after
+            && after.generation != generation
+        {
+            return Err(CodedError::new(
+                codes::STALE_GENERATION,
+                format!(
+                    "frame cursor generation {} is stale; current generation is {generation}",
+                    after.generation
+                ),
+            )
+            .into());
+        }
         let mut receiver = self.sender.subscribe();
-        let frame = tokio::time::timeout(timeout, async {
+        let frame = match tokio::time::timeout(timeout, async {
             loop {
                 if let Some(frame) = receiver.borrow().clone()
                     && frame.generation == generation
+                    && after.is_none_or(|after| frame.frame_id > after.frame_id)
                 {
                     return Ok::<_, anyhow::Error>(frame);
                 }
@@ -83,12 +120,22 @@ impl LatestFrameCache {
             }
         })
         .await
-        .context("timed out waiting for a decoded video frame")??;
+        {
+            Ok(frame) => frame?,
+            Err(_) => {
+                return Err(CodedError::new(
+                    codes::TIMEOUT,
+                    "timed out waiting for a decoded video frame",
+                )
+                .into());
+            }
+        };
 
         let width = frame.frame.width();
         let height = frame.frame.height();
         let age = frame.received_at.elapsed();
         let captured_at = frame.captured_at;
+        let frame_id = frame.frame_id;
         let output = output.to_owned();
         let output_for_worker = output.clone();
         let decoded = frame.frame.clone();
@@ -104,6 +151,7 @@ impl LatestFrameCache {
             width,
             height,
             generation,
+            frame_id,
             frame_age: age,
             captured_at,
         })
@@ -296,6 +344,7 @@ fn decode_access_unit(
                 frame,
                 received_at: unit.received_at.unwrap_or_else(Instant::now),
                 captured_at: SystemTime::now(),
+                frame_id: NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed),
                 generation,
             }),
             Err(error)

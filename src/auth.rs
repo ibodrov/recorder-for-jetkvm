@@ -41,6 +41,23 @@ impl AuthenticatedClient {
         self.no_tls_verify
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_client() -> Self {
+        let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+        let client = Client::builder()
+            .cookie_provider(Arc::clone(&cookie_jar))
+            .build()
+            .expect("test HTTP client");
+        Self {
+            client,
+            cookie_jar,
+            // Port zero has no listener, making HTTP uploads fail immediately
+            // and deterministically exercise their WebRTC fallback.
+            base_url: "http://127.0.0.1:0".to_owned(),
+            no_tls_verify: false,
+        }
+    }
+
     pub fn cookie_header(&self) -> Result<Option<HeaderValue>> {
         let url = Url::parse(&self.base_url).context("invalid JetKVM base URL")?;
         Ok(self.cookie_jar.cookies(&url))

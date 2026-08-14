@@ -36,6 +36,14 @@ impl RpcError {
         }
     }
 
+    fn connection_lost() -> Self {
+        Self {
+            code: -32001,
+            message: "RPC data channel connection lost".to_owned(),
+            data: None,
+        }
+    }
+
     fn malformed(message: impl Into<String>) -> Self {
         Self {
             code: -32700,
@@ -52,6 +60,8 @@ impl fmt::Display for RpcError {
             || self.data.as_ref().and_then(Value::as_str) == Some("not implemented")
         {
             write!(f, ": not implemented")?;
+        } else if !self.message.is_empty() {
+            write!(f, ": {}", self.message)?;
         }
         Ok(())
     }
@@ -104,12 +114,8 @@ impl RpcClient {
     fn with_timeout(channel: Arc<RTCDataChannel>, timeout: Duration) -> Self {
         let pending = PendingMap::default();
         let (notifications, _) = broadcast::channel(64);
-        install_message_handler(
-            &channel,
-            Arc::clone(&pending),
-            notifications.clone(),
-            Arc::clone(&channel),
-        );
+        install_message_handler(&channel, Arc::clone(&pending), notifications.clone());
+        install_disconnect_handlers(&channel, Arc::clone(&pending));
 
         Self {
             channel,
@@ -245,12 +251,9 @@ impl RpcClient {
         .map(|_| ())
     }
     pub async fn scroll(&self, wheel_x: i8, wheel_y: i8) -> Result<()> {
-        self.call::<_, Value>(
-            "wheelReport",
-            serde_json::json!({ "wheelX": wheel_x, "wheelY": wheel_y }),
-        )
-        .await
-        .map(|_| ())
+        self.call::<_, Value>("wheelReport", wheel_report_params(wheel_x, wheel_y)?)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -283,6 +286,13 @@ fn cancel_pending(pending: &PendingMap) {
     let pending = std::mem::take(&mut *pending.lock());
     for (_, response) in pending {
         let _ = response.send(Err(RpcError::connection_changed()));
+    }
+}
+
+fn cancel_pending_for_connection_loss(pending: &PendingMap) {
+    let pending = std::mem::take(&mut *pending.lock());
+    for (_, response) in pending {
+        let _ = response.send(Err(RpcError::connection_lost()));
     }
 }
 
@@ -326,12 +336,12 @@ fn install_message_handler(
     channel: &Arc<RTCDataChannel>,
     pending: PendingMap,
     notifications: broadcast::Sender<RpcNotification>,
-    response_channel: Arc<RTCDataChannel>,
 ) {
+    let response_channel = Arc::downgrade(channel);
     channel.on_message(Box::new(move |message: DataChannelMessage| {
         let pending = Arc::clone(&pending);
         let notifications = notifications.clone();
-        let response_channel = Arc::clone(&response_channel);
+        let response_channel = response_channel.clone();
         Box::pin(async move {
             let Some((response, has_result)) = parse_response(&message.data, &pending) else {
                 return;
@@ -353,7 +363,9 @@ fn install_message_handler(
                             "message": "client method not supported"
                         }
                     });
-                    let _ = response_channel.send_text(payload.to_string()).await;
+                    if let Some(response_channel) = response_channel.upgrade() {
+                        let _ = response_channel.send_text(payload.to_string()).await;
+                    }
                 }
                 return;
             }
@@ -361,6 +373,37 @@ fn install_message_handler(
             complete_response(&pending, response, has_result);
         })
     }));
+}
+
+fn install_disconnect_handlers(channel: &Arc<RTCDataChannel>, pending: PendingMap) {
+    let close_pending = Arc::clone(&pending);
+    channel.on_close(Box::new(move || {
+        let pending = Arc::clone(&close_pending);
+        Box::pin(async move {
+            cancel_pending_for_connection_loss(&pending);
+        })
+    }));
+
+    channel.on_error(Box::new(move |_| {
+        let pending = Arc::clone(&pending);
+        Box::pin(async move {
+            cancel_pending_for_connection_loss(&pending);
+        })
+    }));
+}
+
+fn wheel_report_params(wheel_x: i8, wheel_y: i8) -> Result<Value> {
+    // JetKVM ignores wheelX (its handler only reads wheelY), and firmware
+    // 0.5.8 errors when the field is absent: reject horizontal input as
+    // unsupported instead of silently succeeding, and always send wheelX: 0.
+    if wheel_x != 0 {
+        return Err(crate::error::CodedError::new(
+            crate::error::codes::UNSUPPORTED,
+            "wheelX is not supported by JetKVM",
+        )
+        .into());
+    }
+    Ok(serde_json::json!({ "wheelX": 0, "wheelY": wheel_y }))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -424,6 +467,15 @@ pub struct StorageUpload {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rejects_horizontal_wheel_input() {
+        let error = wheel_report_params(1, 0).expect_err("wheelX should be rejected");
+        assert!(error.to_string().contains("wheelX is not supported"));
+        assert_eq!(
+            wheel_report_params(0, -3).expect("wheelY should be accepted"),
+            serde_json::json!({ "wheelX": 0, "wheelY": -3 })
+        );
+    }
     #[test]
     fn decodes_media_state_wire_shape() {
         let state: VirtualMediaState = serde_json::from_value(serde_json::json!({
@@ -506,9 +558,152 @@ mod tests {
                 .expect_err("request should be cancelled");
             assert_eq!(error.code, -32001);
         }
+
         assert!(pending.lock().is_empty());
     }
+    #[tokio::test]
+    async fn data_channel_close_cancels_pending_rpc_promptly() {
+        let (channel, remote_channel, offer_peer, answer_peer) =
+            connected_data_channel_pair().await;
+        let client = RpcClient::with_timeout(Arc::clone(&channel), Duration::from_secs(10));
+        client
+            .wait_ready(Duration::from_secs(5))
+            .await
+            .expect("RPC channel should open");
 
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        remote_channel.on_message(Box::new(move |_| {
+            let request_tx = request_tx.clone();
+            Box::pin(async move {
+                let _ = request_tx.send(()).await;
+            })
+        }));
+
+        let call_client = client.clone();
+        let call = tokio::spawn(async move {
+            call_client
+                .call_value("pendingMethod", serde_json::json!({}))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .expect("remote peer should receive RPC request")
+            .expect("request notification should be sent");
+
+        channel.close().await.expect("channel should close");
+        let error = tokio::time::timeout(Duration::from_millis(500), call)
+            .await
+            .expect("pending RPC should fail without waiting for its timeout")
+            .expect("RPC task should complete")
+            .expect_err("closed channel should fail the pending RPC");
+        assert!(error.to_string().contains("connection lost"));
+
+        offer_peer.close().await.expect("offer peer should close");
+        answer_peer.close().await.expect("answer peer should close");
+    }
+
+    #[tokio::test]
+    async fn message_handler_does_not_retain_its_data_channel() {
+        let api = webrtc::api::APIBuilder::new().build();
+        let peer = Arc::new(
+            api.new_peer_connection(
+                webrtc::peer_connection::configuration::RTCConfiguration::default(),
+            )
+            .await
+            .expect("peer connection"),
+        );
+        let channel = peer
+            .create_data_channel("rpc", None)
+            .await
+            .expect("data channel");
+        let baseline = Arc::strong_count(&channel);
+
+        {
+            let _client = RpcClient::new(Arc::clone(&channel));
+            assert_eq!(Arc::strong_count(&channel), baseline + 1);
+        }
+
+        assert_eq!(Arc::strong_count(&channel), baseline);
+        peer.close().await.expect("peer should close");
+    }
+
+    async fn connected_data_channel_pair() -> (
+        Arc<RTCDataChannel>,
+        Arc<RTCDataChannel>,
+        Arc<webrtc::peer_connection::RTCPeerConnection>,
+        Arc<webrtc::peer_connection::RTCPeerConnection>,
+    ) {
+        let api = webrtc::api::APIBuilder::new().build();
+        let offer_peer = Arc::new(
+            api.new_peer_connection(
+                webrtc::peer_connection::configuration::RTCConfiguration::default(),
+            )
+            .await
+            .expect("offer peer connection"),
+        );
+        let answer_peer = Arc::new(
+            api.new_peer_connection(
+                webrtc::peer_connection::configuration::RTCConfiguration::default(),
+            )
+            .await
+            .expect("answer peer connection"),
+        );
+        let (remote_tx, mut remote_rx) = tokio::sync::mpsc::channel(1);
+        answer_peer.on_data_channel(Box::new(move |channel| {
+            let remote_tx = remote_tx.clone();
+            Box::pin(async move {
+                let _ = remote_tx.send(channel).await;
+            })
+        }));
+
+        let channel = offer_peer
+            .create_data_channel("rpc", None)
+            .await
+            .expect("offer data channel");
+        let offer = offer_peer.create_offer(None).await.expect("SDP offer");
+        let mut offer_gathered = offer_peer.gathering_complete_promise().await;
+        offer_peer
+            .set_local_description(offer)
+            .await
+            .expect("offer local description");
+        tokio::time::timeout(Duration::from_secs(5), offer_gathered.recv())
+            .await
+            .expect("offer ICE gathering should finish");
+        answer_peer
+            .set_remote_description(
+                offer_peer
+                    .local_description()
+                    .await
+                    .expect("offer local description should be present"),
+            )
+            .await
+            .expect("answer remote description");
+
+        let answer = answer_peer.create_answer(None).await.expect("SDP answer");
+        let mut answer_gathered = answer_peer.gathering_complete_promise().await;
+        answer_peer
+            .set_local_description(answer)
+            .await
+            .expect("answer local description");
+        tokio::time::timeout(Duration::from_secs(5), answer_gathered.recv())
+            .await
+            .expect("answer ICE gathering should finish");
+        offer_peer
+            .set_remote_description(
+                answer_peer
+                    .local_description()
+                    .await
+                    .expect("answer local description should be present"),
+            )
+            .await
+            .expect("offer remote description");
+
+        let remote_channel = tokio::time::timeout(Duration::from_secs(5), remote_rx.recv())
+            .await
+            .expect("remote data channel should arrive")
+            .expect("remote data channel sender should stay alive");
+        (channel, remote_channel, offer_peer, answer_peer)
+    }
     #[tokio::test]
     async fn malformed_correlated_response_fails_request() {
         let pending = PendingMap::default();
