@@ -374,6 +374,7 @@ struct Actor {
     media_event_tx: broadcast::Sender<MediaEvent>,
     shutdown: CancellationToken,
     error: Arc<parking_lot::Mutex<Option<String>>>,
+    done: CancellationToken,
     status: Arc<parking_lot::RwLock<ControllerStatus>>,
     live_hid: Arc<parking_lot::RwLock<Option<LiveHidStatus>>>,
     snapshot_directory: tempfile::TempDir,
@@ -401,6 +402,7 @@ struct ActorChannels {
 struct ActorShared {
     shutdown: CancellationToken,
     error: Arc<parking_lot::Mutex<Option<String>>>,
+    done: CancellationToken,
     status: Arc<parking_lot::RwLock<ControllerStatus>>,
     live_hid: Arc<parking_lot::RwLock<Option<LiveHidStatus>>>,
     cache: LatestFrameCache,
@@ -426,6 +428,7 @@ impl Actor {
         let ActorShared {
             shutdown,
             error,
+            done,
             status,
             live_hid,
             cache,
@@ -441,6 +444,7 @@ impl Actor {
             media_event_tx,
             shutdown,
             error,
+            done,
             status,
             live_hid,
             snapshot_directory,
@@ -455,7 +459,11 @@ impl Actor {
     }
 
     async fn run(mut self) {
-        let mut phase = self.start_attempt(Vec::new());
+        let phase = self.start_attempt(Vec::new());
+        self.run_from_phase(phase).await;
+    }
+
+    async fn run_from_phase(&mut self, mut phase: Phase) {
         let result = loop {
             phase = match phase {
                 Phase::Connecting { attempt, waiters } => {
@@ -471,6 +479,7 @@ impl Actor {
         if let Err(error) = result {
             self.publish_terminal_failure(&error);
         }
+        self.done.cancel();
     }
 
     fn publish_terminal_failure(&mut self, error: &anyhow::Error) {
@@ -1415,6 +1424,7 @@ impl JetKvmController {
                 ActorShared {
                     shutdown,
                     error,
+                    done: done.clone(),
                     status: actor_status,
                     live_hid: actor_live_hid,
                     cache: actor_cache,
@@ -1940,6 +1950,98 @@ mod tests {
         }
     }
 
+    struct TerminalActorHarness {
+        actor: Actor,
+        status: Arc<parking_lot::RwLock<ControllerStatus>>,
+        live_hid: Arc<parking_lot::RwLock<Option<LiveHidStatus>>>,
+        error: Arc<parking_lot::Mutex<Option<String>>>,
+        done: CancellationToken,
+    }
+
+    impl TerminalActorHarness {
+        fn new() -> Self {
+            let generation = 7;
+            let (connector, _) = ScriptedConnector::new(vec![Script::Pending]);
+            let (_command_tx, command_rx) = mpsc::channel(1);
+            let (event_tx, _) = broadcast::channel(1);
+            let (nal_tx, _) = broadcast::channel(1);
+            let (media_event_tx, _) = broadcast::channel(1);
+            let status = Arc::new(parking_lot::RwLock::new(connected_test_status(generation)));
+            let hid = Arc::new(parking_lot::RwLock::new(test_hid_status(1, 1, 0, true)));
+            let live_hid = Arc::new(parking_lot::RwLock::new(Some(live_hid_source(
+                generation, hid,
+            ))));
+            let error = Arc::new(parking_lot::Mutex::new(None));
+            let done = CancellationToken::new();
+            let mut actor = Actor::new(
+                test_config(),
+                connector,
+                ActorChannels {
+                    command_rx,
+                    event_tx,
+                    nal_tx,
+                    media_event_tx,
+                },
+                ActorShared {
+                    shutdown: CancellationToken::new(),
+                    error: Arc::clone(&error),
+                    done: done.clone(),
+                    status: Arc::clone(&status),
+                    live_hid: Arc::clone(&live_hid),
+                    cache: LatestFrameCache::new(),
+                },
+            )
+            .expect("test actor");
+            actor.generation = generation;
+            Self {
+                actor,
+                status,
+                live_hid,
+                error,
+                done,
+            }
+        }
+
+        fn controller(
+            status: Arc<parking_lot::RwLock<ControllerStatus>>,
+            live_hid: Arc<parking_lot::RwLock<Option<LiveHidStatus>>>,
+            error: Arc<parking_lot::Mutex<Option<String>>>,
+            done: CancellationToken,
+        ) -> JetKvmController {
+            let snapshot = status.read().clone();
+            let mut controller = status_controller(snapshot, None);
+            controller.status = status;
+            controller.live_hid = live_hid;
+            controller.lifecycle = Arc::new(ControllerLifecycle {
+                shutdown: CancellationToken::new(),
+                done,
+                error,
+            });
+            controller
+        }
+    }
+
+    fn assert_terminal_state(
+        status: &parking_lot::RwLock<ControllerStatus>,
+        live_hid: &parking_lot::RwLock<Option<LiveHidStatus>>,
+        error: &parking_lot::Mutex<Option<String>>,
+    ) {
+        let terminal = status.read().clone();
+        assert!(!terminal.connected);
+        assert_eq!(terminal.state, ConnectionState::ShuttingDown);
+        assert!(terminal.hid.is_none());
+        assert!(terminal.frame.is_none());
+        assert!(terminal.device_version.is_none());
+        assert!(live_hid.read().is_none());
+        let message = error.lock().clone().expect("terminal error stored");
+        for secret in ["test-password", "secret-token", "operator:", "private.iso"] {
+            assert!(
+                !message.contains(secret),
+                "{secret:?} leaked in {message:?}"
+            );
+        }
+    }
+
     #[test]
     fn connection_config_debug_redacts_password() {
         let config = ConnectionConfig {
@@ -2092,44 +2194,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_actor_failure_clears_connected_state_and_is_stable() {
-        let (connector, _) = ScriptedConnector::new(vec![Script::Pending]);
-        let (_command_tx, command_rx) = mpsc::channel(1);
-        let (event_tx, _) = broadcast::channel(1);
-        let (nal_tx, _) = broadcast::channel(1);
-        let (media_event_tx, _) = broadcast::channel(1);
-        let status = Arc::new(parking_lot::RwLock::new(connected_test_status(7)));
-        let hid = Arc::new(parking_lot::RwLock::new(test_hid_status(1, 1, 0, true)));
-        let live_hid = Arc::new(parking_lot::RwLock::new(Some(live_hid_source(
-            7,
-            Arc::clone(&hid),
-        ))));
-        let actor_error = Arc::new(parking_lot::Mutex::new(None));
-        let mut actor = Actor::new(
-            test_config(),
-            connector,
-            ActorChannels {
-                command_rx,
-                event_tx: event_tx.clone(),
-                nal_tx: nal_tx.clone(),
-                media_event_tx,
-            },
-            ActorShared {
-                shutdown: CancellationToken::new(),
-                error: Arc::clone(&actor_error),
-                status: Arc::clone(&status),
-                live_hid: Arc::clone(&live_hid),
-                cache: LatestFrameCache::new(),
-            },
-        )
-        .expect("test actor");
-        actor.generation = 7;
+    async fn disconnect_cleanup_failure_runs_terminal_actor_lifecycle() {
+        let TerminalActorHarness {
+            mut actor,
+            status,
+            live_hid,
+            error,
+            done,
+        } = TerminalActorHarness::new();
         let (disconnect_tx, disconnect_rx) = oneshot::channel();
         let phase = actor.finish_disconnect(
             disconnect_tx,
             Err(anyhow!(
                 "disconnect cleanup failed for test-password at \
-                 http://host/jetkvm-controller/media/secret-token"
+                 https://operator:secret-token@example.invalid/private.iso?token=secret-token"
             )),
         );
         let disconnect_error = disconnect_rx
@@ -2140,46 +2218,18 @@ mod tests {
             crate::error::error_code(&disconnect_error),
             codes::OPERATION_FAILED
         );
-        let Phase::Shutdown(result) = phase else {
-            panic!("disconnect cleanup failure must terminate the actor");
-        };
-        actor.publish_terminal_failure(&result.expect_err("terminal disconnect error"));
+        for secret in ["test-password", "secret-token", "private.iso"] {
+            assert!(!disconnect_error.to_string().contains(secret));
+        }
 
-        let Phase::Shutdown(shutdown_result) =
-            actor.finish_shutdown(Err(anyhow!("shutdown cleanup failed for test-password")))
-        else {
-            panic!("shutdown cleanup result must terminate the actor");
-        };
+        actor.run_from_phase(phase).await;
         assert!(
-            shutdown_result
-                .expect_err("shutdown cleanup failure is retained")
-                .to_string()
-                .contains("test-password"),
-            "internal error remains available until terminal publication sanitizes it"
+            done.is_cancelled(),
+            "actor lifecycle must signal completion"
         );
+        assert_terminal_state(&status, &live_hid, &error);
 
-        let terminal = status.read().clone();
-        assert!(!terminal.connected);
-        assert_eq!(terminal.state, ConnectionState::ShuttingDown);
-        assert!(terminal.hid.is_none());
-        assert!(terminal.frame.is_none());
-        assert!(terminal.device_version.is_none());
-        assert!(live_hid.read().is_none());
-        let message = actor_error.lock().clone().expect("terminal error stored");
-        assert!(!message.contains("test-password"));
-        assert!(!message.contains("secret-token"));
-
-        let mut controller = status_controller(terminal, None);
-        let done = CancellationToken::new();
-        done.cancel();
-        controller.status = status;
-        controller.live_hid = live_hid;
-        controller.lifecycle = Arc::new(ControllerLifecycle {
-            shutdown: CancellationToken::new(),
-            done,
-            error: actor_error,
-        });
-
+        let controller = TerminalActorHarness::controller(status, live_hid, error, done.clone());
         let status_error = controller
             .status()
             .await
@@ -2204,13 +2254,80 @@ mod tests {
             concurrent.push(tokio::spawn(async move { controller.shutdown().await }));
         }
         for result in concurrent {
-            let error = result
+            let concurrent_error = result
                 .await
                 .expect("concurrent shutdown task")
                 .expect_err("terminal failure remains stable during shutdown");
-            assert_eq!(crate::error::error_code(&error), codes::OPERATION_FAILED);
-            assert_eq!(error.to_string(), status_error.to_string());
+            assert_eq!(
+                crate::error::error_code(&concurrent_error),
+                codes::OPERATION_FAILED
+            );
+            assert_eq!(concurrent_error.to_string(), status_error.to_string());
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_failure_runs_terminal_actor_lifecycle() {
+        let TerminalActorHarness {
+            mut actor,
+            status,
+            live_hid,
+            error,
+            done,
+        } = TerminalActorHarness::new();
+        let phase = actor.finish_shutdown(Err(anyhow!(
+            "shutdown cleanup failed for test-password at \
+             https://operator:secret-token@example.invalid/private.iso?signature=secret-token"
+        )));
+
+        actor.run_from_phase(phase).await;
+        assert!(
+            done.is_cancelled(),
+            "actor lifecycle must signal completion"
+        );
+        assert_terminal_state(&status, &live_hid, &error);
+
+        let controller = TerminalActorHarness::controller(status, live_hid, error, done);
+        let status_error = controller
+            .status()
+            .await
+            .expect_err("shutdown cleanup failure is terminal");
+        assert_eq!(
+            crate::error::error_code(&status_error),
+            codes::OPERATION_FAILED
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_actor_failure_runs_terminal_lifecycle_from_connected_state() {
+        let TerminalActorHarness {
+            mut actor,
+            status,
+            live_hid,
+            error,
+            done,
+        } = TerminalActorHarness::new();
+        actor
+            .run_from_phase(Phase::Shutdown(Err(anyhow!(
+                "unexpected actor failure at \
+                 https://operator:secret-token@example.invalid/private.iso?token=secret-token"
+            ))))
+            .await;
+
+        assert!(
+            done.is_cancelled(),
+            "actor lifecycle must signal completion"
+        );
+        assert_terminal_state(&status, &live_hid, &error);
+        let controller = TerminalActorHarness::controller(status, live_hid, error, done);
+        let status_error = controller
+            .status()
+            .await
+            .expect_err("unexpected actor failure is terminal");
+        assert_eq!(
+            crate::error::error_code(&status_error),
+            codes::OPERATION_FAILED
+        );
     }
 
     #[test]

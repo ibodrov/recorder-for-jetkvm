@@ -121,9 +121,9 @@ Successful `key`, `type_text`, `mouse_move`, `mouse_button`, and
 {"id":8,"result":{"generation":1,"cursor":{"generation":1,"frame_id":42}}}
 ```
 
-The receipt cursor identifies the newest decoded frame captured after the
-device-facing operation completed. Pass it back as `after` to wait for a
-strictly newer frame:
+The receipt cursor is sampled immediately after the device-facing operation
+completes and identifies the newest decoded frame available at that boundary.
+Pass it back as `after` to wait for a strictly newer frame:
 
 ```json
 {"id":9,"method":"snapshot","params":{"after":{"generation":1,"frame_id":42}}}

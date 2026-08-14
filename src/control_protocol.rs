@@ -791,12 +791,24 @@ fn public_error(error: &anyhow::Error) -> ProtocolError {
     }
 }
 
-pub(crate) fn redact(mut message: String) -> String {
+pub(crate) fn redact(message: String) -> String {
+    let mut message = redact_urls(&message);
     let lowercase = message.to_ascii_lowercase();
-    if let Some(index) = ["cookie:", "authorization:", "password=", "\"password\""]
-        .into_iter()
-        .filter_map(|marker| lowercase.find(marker))
-        .min()
+    if let Some(index) = [
+        "authorization:",
+        "proxy-authorization:",
+        "bearer ",
+        "cookie:",
+        "cookie=",
+        "set-cookie:",
+        "password=",
+        "password:",
+        "\"password\"",
+        "\"token\"",
+    ]
+    .into_iter()
+    .filter_map(|marker| lowercase.find(marker))
+    .min()
     {
         message.truncate(index);
         message.push_str("<redacted>");
@@ -814,6 +826,44 @@ pub(crate) fn redact(mut message: String) -> String {
         message.push_str("<redacted>");
     }
     message
+}
+
+/// Replaces URL-shaped error fragments wholesale. Public errors need the
+/// operation and failure class, not caller-supplied paths, userinfo, queries,
+/// or fragments that may carry credentials.
+fn redact_urls(message: &str) -> String {
+    const SCHEMES: [&str; 3] = ["http://", "https://", "file://"];
+
+    let lowercase = message.to_ascii_lowercase();
+    let mut output = String::with_capacity(message.len());
+    let mut cursor = 0;
+    while cursor < message.len() {
+        let Some(start) = SCHEMES
+            .into_iter()
+            .filter_map(|scheme| lowercase[cursor..].find(scheme))
+            .map(|relative| cursor + relative)
+            .min()
+        else {
+            output.push_str(&message[cursor..]);
+            break;
+        };
+        output.push_str(&message[cursor..start]);
+        let end = message[start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                (offset > 0
+                    && (character.is_whitespace()
+                        || matches!(
+                            character,
+                            '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
+                        )))
+                .then_some(start + offset)
+            })
+            .unwrap_or(message.len());
+        output.push_str("<redacted-url>");
+        cursor = end;
+    }
+    output
 }
 
 fn valid_id(id: &Value) -> bool {
@@ -905,27 +955,42 @@ mod tests {
     }
 
     #[test]
-    fn output_redacts_local_tokens_and_credentials() {
-        assert_eq!(
-            redact("failed http://host/jetkvm-controller/media/secret-token".to_owned()),
-            "failed http://host/jetkvm-controller/media/<redacted>"
-        );
-        assert_eq!(
-            redact("request Cookie: session=secret".to_owned()),
-            "request <redacted>"
-        );
-        assert_eq!(
-            redact("upload uploadId=secret-token".to_owned()),
-            "upload uploadId=<redacted>"
-        );
+    fn output_redacts_urls_tokens_and_credentials() {
         for message in [
+            "failed http://host/jetkvm-controller/media/secret-token",
+            "failed https://user:password@example.invalid/image.iso?token=secret#fragment",
+            "failed FILE:///home/operator/private.iso",
+            "request Cookie: session=secret",
+            "request cookie=session-secret",
             "request authorization: Bearer secret",
+            "request Proxy-Authorization: Basic secret",
+            "request bearer secret",
+            "response Set-Cookie: session=secret",
             r#"request {"password":"secret"}"#,
+            r#"request {"token":"secret"}"#,
+            "upload uploadId=secret-token",
         ] {
             let redacted = redact(message.to_owned());
-            assert!(!redacted.contains("secret"));
-            assert!(redacted.ends_with("<redacted>"));
+            for secret in ["secret", "password@example", "/home/operator", "image.iso"] {
+                assert!(
+                    !redacted.contains(secret),
+                    "{secret:?} leaked from {message:?} as {redacted:?}"
+                );
+            }
+            assert!(
+                redacted.contains("<redacted"),
+                "{message:?} was not redacted"
+            );
         }
+
+        assert_eq!(
+            redact(
+                "first https://user:secret@one.invalid/a?token=x then \
+                 http://two.invalid/private.iso?signature=y failed"
+                    .to_owned()
+            ),
+            "first <redacted-url> then <redacted-url> failed"
+        );
     }
 
     #[test]
